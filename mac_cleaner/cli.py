@@ -56,6 +56,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
+from mac_cleaner import __version__
 from mac_cleaner.audit import AuditLogger
 from mac_cleaner.config import Settings, MODEL_REGISTRY
 from mac_cleaner.executor import Executor
@@ -176,7 +177,7 @@ def _banner(model_display: str, safe_mode: bool) -> Panel:
         else "[dim]Scan + ready to clean[/dim]"
     )
     return Panel(
-        f"[bold cyan]💨  PoofMac[/bold cyan]  [dim]v0.2.0[/dim]\n"
+        f"[bold cyan]💨  PoofMac[/bold cyan]  [dim]v{__version__}[/dim]\n"
         f"[dim]AI-powered Mac disk cleaner[/dim]\n\n"
         f"[dim]Model:[/dim]  {model_display}\n"
         f"[dim]Mode:[/dim]   {mode_line}",

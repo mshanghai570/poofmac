@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "poofmac"
-version = "0.2.2"
+version = "0.2.3"
 description = "PoofMac — local AI-powered Mac disk cleaner. Runs on Ollama, no subscription, no data leaves your machine."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,8 +37,8 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://poofmac.app"
-Repository = "https://github.com/lesteroliver911/poofmac"
-"Bug Tracker" = "https://github.com/lesteroliver911/poofmac/issues"
+Repository = "https://github.com/mshanghai570/poofmac"
+"Bug Tracker" = "https://github.com/mshanghai570/poofmac/issues"
 
 [project.scripts]
 poofmac = "mac_cleaner.main:run"
@@ -70,7 +70,7 @@ asyncio_mode = "auto"
 [tool.briefcase]
 project_name = "PoofMac"
 bundle = "app.poofmac"
-version = "0.2.2"
+version = "0.2.3"
 url = "https://poofmac.app"
 license.file = "LICENSE"
 author = "PoofMac Contributors"
@@ -90,8 +90,11 @@ requires = [
 ]
 
 [tool.briefcase.app.mac_cleaner.macOS]
-# macOS entitlements — disk access and network for LLM APIs
-minimum_os_version = "12.0"
-entitlements."com.apple.security.files.user-selected.read-write" = true
-entitlements."com.apple.security.network.client" = true
+# macOS build settings — note the exact key names Briefcase reads:
+# "min_os_version" (not "minimum_os_version") and singular "entitlement.".
+# The wrong spellings are silently ignored, producing a bundle with no
+# entitlements and a default deployment target.
+min_os_version = "12.0"
+entitlement."com.apple.security.files.user-selected.read-write" = true
+entitlement."com.apple.security.network.client" = true
 requires = []

@@ -56,6 +56,7 @@ from textual.widgets import (
     Static,
 )
 
+from mac_cleaner import __version__
 from mac_cleaner.audit import AuditLogger
 from mac_cleaner.config import Settings
 from mac_cleaner.executor import Executor
@@ -765,7 +766,7 @@ def run() -> None:
     parser.add_argument(
         "--version",
         action="version",
-        version="poofmac 0.2.0",
+        version=f"poofmac {__version__}",
     )
     args = parser.parse_args()
 

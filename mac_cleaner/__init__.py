@@ -2,7 +2,7 @@
 # Copyright (c) 2026 lesteroliver — https://poofmac.app
 """PoofMac — AI-powered Mac disk cleaner with robust safety guardrails."""
 
-__version__   = "0.2.2"
+__version__   = "0.2.3"
 __author__    = "lesteroliver"
 __license__   = "MIT"
 __uri__       = "https://poofmac.app"
