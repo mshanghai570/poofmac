@@ -481,9 +481,9 @@ class MacCleanerApp(App):
             err_text = event["text"]
             err_lower = err_text.lower()
             if "authentication" in err_lower or "api key" in err_lower or "unauthorized" in err_lower:
-                hint = "\n[dim]  → Check your API key in .env (ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_API_KEY)[/dim]"
+                hint = "\n[dim]  → Check your API key in .env (ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_API_KEY / OPENAI_COMPAT_API_KEY)[/dim]"
             elif "connection refused" in err_lower or ("ollama" in err_lower and "connect" in err_lower):
-                hint = "\n[dim]  → Is Ollama running? Start it with: [bold]ollama serve[/bold][/dim]"
+                hint = "\n[dim]  → Is the model server running? Try [bold]ollama serve[/bold], or check OPENAI_COMPAT_BASE_URL in .env[/dim]"
             elif "no model" in err_lower or "model not found" in err_lower:
                 hint = "\n[dim]  → Set PREFERRED_LOCAL_MODEL or PREFERRED_CLOUD_MODEL in .env[/dim]"
             else:

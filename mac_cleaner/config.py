@@ -4,10 +4,13 @@
 Application configuration — model selection and runtime settings.
 
 Priority order for model selection:
-  1. ANTHROPIC_API_KEY  → Anthropic direct (fastest, most reliable)
-  2. OPENROUTER_API_KEY → OpenRouter (multi-provider gateway)
-  3. OPENAI_API_KEY     → OpenAI direct
-  4. Ollama local       → auto-detects best available model
+  1. ANTHROPIC_API_KEY       → Anthropic direct (fastest, most reliable)
+  2. OPENROUTER_API_KEY      → OpenRouter (multi-provider gateway)
+  3. OPENAI_API_KEY          → OpenAI direct
+  4. OPENAI_COMPAT_BASE_URL  → any OpenAI-compatible endpoint
+                                (vLLM, LM Studio, llama.cpp, Ollama /v1,
+                                 Groq, DeepSeek, Together, OpenAI proxies …)
+  5. Ollama local            → auto-detects best available model
 
 Reads from .env file via pydantic-settings.
 """
@@ -87,6 +90,14 @@ class Settings(BaseSettings):
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     ollama_api_key: str = Field(default="", alias="OLLAMA_API_KEY")
 
+    # OpenAI-compatible endpoint (any service speaking the OpenAI
+    # chat-completions API — vLLM, LM Studio, llama.cpp server, Ollama's
+    # /v1, Groq, DeepSeek, Together, an OpenAI-base-URL proxy, …).
+    # Only BASE_URL is required; the key may be a dummy for local servers.
+    openai_compat_base_url: str = Field(default="", alias="OPENAI_COMPAT_BASE_URL")
+    openai_compat_api_key: str = Field(default="", alias="OPENAI_COMPAT_API_KEY")
+    openai_compat_model: str = Field(default="", alias="OPENAI_COMPAT_MODEL")
+
     # Model preferences
     preferred_cloud_model: str = Field(
         default="claude-sonnet-4-6", alias="PREFERRED_CLOUD_MODEL"
@@ -97,6 +108,41 @@ class Settings(BaseSettings):
 
     # Safety
     safe_mode: bool = Field(default=False, alias="SAFE_MODE")
+
+    def _use_openai_compat(self) -> bool:
+        """True when the OpenAI-compatible endpoint is the selected provider."""
+        return bool(
+            self.openai_compat_base_url.strip()
+            and self.openai_compat_model.strip()
+            and not self.anthropic_api_key
+            and not self.openrouter_api_key
+            and not self.openai_api_key
+        )
+
+    def set_model_override(self, model: str) -> None:
+        """
+        Apply a one-run model override (--model). Routes to whichever setting
+        the active provider reads its model from.
+        """
+        if self._use_openai_compat():
+            self.openai_compat_model = model
+        else:
+            self.preferred_local_model = model
+
+    def completion_kwargs(self) -> dict:
+        """
+        Extra keyword arguments for litellm.completion() for the active
+        provider. Only the OpenAI-compatible endpoint needs any — it must be
+        told where to connect. Returns {} for every other provider.
+        """
+        if not self._use_openai_compat():
+            return {}
+        return {
+            "api_base": self.openai_compat_base_url.strip().rstrip("/"),
+            # Local servers ignore the key, but litellm requires one for
+            # openai/* models — send a harmless placeholder instead.
+            "api_key": self.openai_compat_api_key.strip() or "not-needed",
+        }
 
     def get_active_model(self) -> tuple[str, str]:
         """
@@ -128,6 +174,14 @@ class Settings(BaseSettings):
             model = self.preferred_cloud_model or "gpt-4o"
             return model, f"{model} (OpenAI)"
 
+        if self._use_openai_compat():
+            # litellm routes openai/<model> through the OpenAI-compatible
+            # Chat Completions handler, so api_base/api_key from
+            # completion_kwargs() point it at the custom endpoint.
+            model = self.openai_compat_model.strip()
+            host = self._compat_host()
+            return f"openai/{model}", f"{model} (Custom · {host})"
+
         # Try Ollama
         local = self._detect_ollama_model()
         if local:
@@ -138,9 +192,21 @@ class Settings(BaseSettings):
             "Options:\n"
             "  1. Add ANTHROPIC_API_KEY to .env  (recommended)\n"
             "  2. Add OPENROUTER_API_KEY to .env\n"
-            "  3. Install Ollama: https://ollama.com  then:\n"
+            "  3. Add OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_MODEL to .env\n"
+            "     (any OpenAI-compatible server: vLLM, LM Studio, Groq, …)\n"
+            "  4. Install Ollama: https://ollama.com  then:\n"
             f"     ollama pull {self.preferred_local_model}"
         )
+
+    def _compat_host(self) -> str:
+        """Host:port of the custom endpoint, for display purposes."""
+        from urllib.parse import urlparse
+
+        raw = self.openai_compat_base_url.strip()
+        try:
+            return urlparse(raw if "://" in raw else f"//{raw}").netloc or raw
+        except ValueError:
+            return raw
 
     def _detect_ollama_model(self) -> Optional[str]:
         """

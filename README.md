@@ -174,6 +174,23 @@ cloud account.
 | Anthropic | `claude-haiku-4-5` | Fastest, lightest cost |
 | OpenAI | `gpt-4.1` | Reliable tool-calling |
 | OpenRouter | any | One key for many models |
+| OpenAI-compatible | any | vLLM, LM Studio, Ollama `/v1`, Groq, DeepSeek, … |
+
+### Any OpenAI-compatible endpoint
+
+Already run a model server — or have a key to a service that speaks the OpenAI
+chat-completions API? Point PoofMac at it directly:
+
+```bash
+# .env
+OPENAI_COMPAT_BASE_URL=http://localhost:11434/v1   # or your server's /v1
+OPENAI_COMPAT_API_KEY=                            # blank is fine for local servers
+OPENAI_COMPAT_MODEL=qwen3.6:27b                   # exactly as the endpoint lists it
+```
+
+The same three settings live under **Settings → Custom** in the desktop GUI, and
+the setup wizard offers it as "OpenAI-compatible (custom endpoint)" on first run.
+It is used whenever no Anthropic / OpenRouter / OpenAI key is set.
 
 ---
 

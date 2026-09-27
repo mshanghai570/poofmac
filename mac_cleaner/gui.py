@@ -869,9 +869,12 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.t = t
+        # Set after a save when the active provider/model actually changed, so
+        # the main window can drop its cached agent and pick up the new model.
+        self.provider_changed = False
         self.setWindowTitle("PoofMac Settings")
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.setFixedSize(560, 460)
+        self.setFixedSize(560, 540)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 16)
@@ -885,6 +888,7 @@ class SettingsDialog(QDialog):
 
         tabs = QTabWidget()
         tabs.addTab(self._build_api_tab(), "API Keys")
+        tabs.addTab(self._build_compat_tab(), "Custom")
         tabs.addTab(self._build_models_tab(), "Models")
         tabs.addTab(self._build_safety_tab(), "Safety")
         root.addWidget(tabs, stretch=1)
@@ -934,7 +938,62 @@ class SettingsDialog(QDialog):
 
         note = QLabel(
             "Keys are saved to your .env file. They are never sent anywhere except "
-            "the provider you select."
+            "the provider you select.\n"
+            "Using vLLM, LM Studio, Groq or another OpenAI-compatible server? "
+            "See the Custom tab."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            f"font-size: 11px; color: {self.t.text_tertiary}; background: transparent;"
+        )
+        layout.addWidget(note)
+        layout.addStretch()
+        return w
+
+    def _build_compat_tab(self) -> QWidget:
+        """Any OpenAI-compatible endpoint — vLLM, LM Studio, llama.cpp,
+        Ollama /v1, Groq, DeepSeek, Together, OpenAI base-URL proxies …"""
+        w = QWidget()
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "Point PoofMac at any service that speaks the OpenAI "
+            "chat-completions API."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(
+            f"font-size: 12px; color: {self.t.text_secondary}; background: transparent;"
+        )
+        layout.addWidget(intro)
+
+        layout.addWidget(QLabel("Base URL"))
+        self._compat_base_edit = QLineEdit(self.settings.openai_compat_base_url)
+        self._compat_base_edit.setPlaceholderText(
+            "http://localhost:11434/v1  ·  http://localhost:1234/v1  ·  "
+            "https://api.groq.com/openai/v1"
+        )
+        self._compat_base_edit.setEchoMode(QLineEdit.EchoMode.Normal)
+        layout.addWidget(self._compat_base_edit)
+
+        layout.addWidget(QLabel("API key (optional — local servers need none)"))
+        self._compat_key_edit = QLineEdit(self.settings.openai_compat_api_key)
+        self._compat_key_edit.setPlaceholderText("leave blank for local servers")
+        self._compat_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        layout.addWidget(self._compat_key_edit)
+
+        layout.addWidget(QLabel("Model name (exactly as the endpoint lists it)"))
+        self._compat_model_edit = QLineEdit(self.settings.openai_compat_model)
+        self._compat_model_edit.setPlaceholderText(
+            "qwen3.6:27b  ·  llama3.1-8b-instruct  ·  deepseek-chat"
+        )
+        layout.addWidget(self._compat_model_edit)
+
+        note = QLabel(
+            "Saved to .env as OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY / "
+            "OPENAI_COMPAT_MODEL. This provider is used only when the Anthropic, "
+            "OpenRouter and OpenAI keys are all empty."
         )
         note.setWordWrap(True)
         note.setStyleSheet(
@@ -1021,6 +1080,11 @@ class SettingsDialog(QDialog):
 
     def _save_and_close(self) -> None:
         try:
+            try:
+                prev_active = self.settings.get_active_model()
+            except Exception:  # noqa: BLE001
+                prev_active = None
+
             from dotenv import find_dotenv, set_key
             env_path = find_dotenv(usecwd=True) or ".env"
 
@@ -1028,6 +1092,17 @@ class SettingsDialog(QDialog):
             set_key(env_path, "ANTHROPIC_API_KEY", self._anthropic_edit.text().strip())
             set_key(env_path, "OPENROUTER_API_KEY", self._openrouter_edit.text().strip())
             set_key(env_path, "OPENAI_API_KEY", self._openai_edit.text().strip())
+
+            # OpenAI-compatible endpoint (Custom tab)
+            compat_base = self._compat_base_edit.text().strip().rstrip("/")
+            compat_key = self._compat_key_edit.text().strip()
+            compat_model = self._compat_model_edit.text().strip()
+            set_key(env_path, "OPENAI_COMPAT_BASE_URL", compat_base)
+            set_key(env_path, "OPENAI_COMPAT_API_KEY", compat_key)
+            set_key(env_path, "OPENAI_COMPAT_MODEL", compat_model)
+            self.settings.openai_compat_base_url = compat_base
+            self.settings.openai_compat_api_key = compat_key
+            self.settings.openai_compat_model = compat_model
 
             # Cloud model
             cloud_idx = self._cloud_model_combo.currentIndex()
@@ -1059,6 +1134,12 @@ class SettingsDialog(QDialog):
                 self.settings.openrouter_api_key = self._openrouter_edit.text().strip()
             if self._openai_edit.text().strip():
                 self.settings.openai_api_key = self._openai_edit.text().strip()
+
+            try:
+                new_active = self.settings.get_active_model()
+            except Exception:  # noqa: BLE001
+                new_active = None
+            self.provider_changed = prev_active != new_active
 
         except Exception as exc:  # noqa: BLE001
             # Non-fatal — settings still applied in memory
@@ -1339,7 +1420,7 @@ class PoofMacWindow(QMainWindow):
 
         try:
             _, display = self.settings.get_active_model()
-            if any(x in display for x in ("(Anthropic)", "(OpenRouter)", "(OpenAI)")):
+            if any(x in display for x in ("(Anthropic)", "(OpenRouter)", "(OpenAI)", "(Custom")):
                 self.model_combo.addItem(f"✓ {display}")
                 self.model_combo.insertSeparator(1)
         except RuntimeError:
@@ -1522,14 +1603,16 @@ class PoofMacWindow(QMainWindow):
                 hint = (
                     "Authentication failed.\n\n"
                     "Check your API key in .env:\n"
-                    "  ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_API_KEY"
+                    "  ANTHROPIC_API_KEY / OPENAI_API_KEY / OLLAMA_API_KEY\n"
+                    "  OPENAI_COMPAT_API_KEY (custom endpoint)"
                 )
             elif "connection refused" in text_lower or ("ollama" in text_lower and "connect" in text_lower):
                 hint = (
-                    "Cannot reach Ollama.\n\n"
+                    "Cannot reach the model server.\n\n"
                     "Start the server first:\n"
                     "  ollama serve\n\n"
-                    "Or set PREFERRED_CLOUD_MODEL in .env"
+                    "Or check OPENAI_COMPAT_BASE_URL in .env if you use a "
+                    "custom endpoint, or set PREFERRED_CLOUD_MODEL."
                 )
             elif "no model" in text_lower or "model not found" in text_lower:
                 hint = (
@@ -1800,6 +1883,17 @@ class PoofMacWindow(QMainWindow):
             self._log(
                 f'<span style="color:{self.t.accent};">Settings saved.</span>'
             )
+            if dlg.provider_changed:
+                # Drop the cached agent so the new provider/model applies now
+                self._chat_agent = None
+                try:
+                    _, display = self.settings.get_active_model()
+                    self._log(
+                        f'<span style="color:{self.t.accent};">'
+                        f'Model \u2192 <b>{display}</b></span>'
+                    )
+                except RuntimeError:
+                    pass
             # Refresh model picker after potential key changes
             self._populate_model_picker()
             # Apply safe mode from settings

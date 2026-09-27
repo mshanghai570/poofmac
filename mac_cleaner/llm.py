@@ -185,6 +185,11 @@ class CleanerAgent:
             turns += 1
             yield {"type": "status", "text": f"Thinking… ({self.model_display})"}
 
+            # Provider extras (api_base/api_key for a custom OpenAI-compatible
+            # endpoint; empty for every other provider). Re-read each turn so
+            # Settings edited in the GUI apply to an already-running agent.
+            extra_kwargs = self.settings.completion_kwargs()
+
             response = None
             for attempt in range(1, 4):  # up to 3 retries for transient errors
                 try:
@@ -195,6 +200,7 @@ class CleanerAgent:
                         tool_choice="auto",
                         temperature=0,  # Deterministic — critical for file operations
                         max_tokens=4096,
+                        **extra_kwargs,
                     )
                     break  # success — exit retry loop
                 except litellm.RateLimitError as exc:
@@ -206,7 +212,9 @@ class CleanerAgent:
                         "text": (
                             "Authentication failed. Check your API key in .env\n"
                             "Anthropic: https://console.anthropic.com\n"
-                            "OpenRouter: https://openrouter.ai"
+                            "OpenRouter: https://openrouter.ai\n"
+                            "Custom endpoint: OPENAI_COMPAT_API_KEY / "
+                            "OPENAI_COMPAT_BASE_URL"
                         ),
                     }
                     return

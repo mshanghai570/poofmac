@@ -229,12 +229,12 @@ def run_chat(
     in plain English and the AI decides what tools to call.
     """
     if model_override:
-        settings.preferred_local_model = model_override
+        settings.set_model_override(model_override)
 
     if not _is_configured(settings):
         settings = run_setup_wizard(settings)
         if model_override:
-            settings.preferred_local_model = model_override
+            settings.set_model_override(model_override)
 
     _, model_display = settings.get_active_model()
 
@@ -321,6 +321,17 @@ _PROVIDERS = [
         "setting": "PREFERRED_CLOUD_MODEL",
     },
     {
+        "key":      "openai_compat",
+        "label":    "OpenAI-compatible (custom endpoint)",
+        "note":     "vLLM, LM Studio, Ollama /v1, Groq, DeepSeek …  —  any OpenAI-compatible API",
+        "env_key":  "OPENAI_COMPAT_API_KEY",
+        "models":   [],          # free-text model id — typed in step 2
+        "default":  "",
+        "setting":  "OPENAI_COMPAT_MODEL",
+        "custom":   True,
+        "base_url": "OPENAI_COMPAT_BASE_URL",
+    },
+    {
         "key":     "openrouter",
         "label":   "OpenRouter",
         "note":    "One key, many models  —  openrouter.ai",
@@ -370,6 +381,9 @@ def _is_configured(settings: Settings) -> bool:
         settings.openrouter_api_key,
         settings.openai_api_key,
         settings.ollama_api_key,
+        # A custom endpoint counts once its URL and model are set — the API
+        # key is optional on local servers
+        (settings.openai_compat_base_url and settings.openai_compat_model),
     ])
     # A local model is usable without a key (Ollama local)
     local = settings.preferred_local_model
@@ -414,27 +428,71 @@ def run_setup_wizard(settings: Settings) -> Settings:
     console.print()
 
     # ── Step 2: choose model ──────────────────────────────────────────────────
-    console.print(f"[bold]Step 2 of 3 — Choose a model[/bold]\n")
-    for i, (model_id, desc) in enumerate(provider["models"], 1):
-        recommended = " [dim](recommended)[/dim]" if model_id == provider["default"] else ""
-        console.print(f"  [cyan]{i}[/cyan]  {desc}{recommended}")
-    console.print()
-
-    while True:
-        model_choice = Prompt.ask(
-            "  Enter a number",
-            default="1",
-            choices=[str(i) for i in range(1, len(provider["models"]) + 1)],
-            console=console,
+    base_url = ""
+    if provider.get("custom"):
+        # OpenAI-compatible endpoint — free-text base URL + model id
+        console.print("[bold]Step 2 of 3 — Endpoint & model[/bold]\n")
+        console.print(
+            "  [dim]Any service that speaks the OpenAI chat-completions API works:[/dim]\n"
+            "  [dim]vLLM · LM Studio · llama.cpp server · Ollama /v1 · Groq ·\n"
+            "  DeepSeek · Together · proxies · even a real OpenAI base URL[/dim]\n"
         )
-        chosen_model, chosen_desc = provider["models"][int(model_choice) - 1]
-        break
+        while True:
+            base_url = Prompt.ask(
+                "  Base URL",
+                default="http://localhost:11434/v1",
+                console=console,
+            ).strip()
+            if base_url:
+                break
+        while True:
+            chosen_model = Prompt.ask(
+                "  Model name (exactly as the endpoint lists it)",
+                console=console,
+            ).strip()
+            if chosen_model:
+                break
+        chosen_desc = chosen_model
+        console.print(
+            f"\n  [green]✓[/green]  Selected: [bold]{chosen_model}[/bold] "
+            f"at [bold]{base_url}[/bold]\n"
+        )
+    else:
+        console.print(f"[bold]Step 2 of 3 — Choose a model[/bold]\n")
+        for i, (model_id, desc) in enumerate(provider["models"], 1):
+            recommended = " [dim](recommended)[/dim]" if model_id == provider["default"] else ""
+            console.print(f"  [cyan]{i}[/cyan]  {desc}{recommended}")
+        console.print()
 
-    console.print(f"\n  [green]✓[/green]  Selected: [bold]{chosen_desc}[/bold]\n")
+        while True:
+            model_choice = Prompt.ask(
+                "  Enter a number",
+                default="1",
+                choices=[str(i) for i in range(1, len(provider["models"]) + 1)],
+                console=console,
+            )
+            chosen_model, chosen_desc = provider["models"][int(model_choice) - 1]
+            break
+
+        console.print(f"\n  [green]✓[/green]  Selected: [bold]{chosen_desc}[/bold]\n")
 
     # ── Step 3: API key (skip for local Ollama) ───────────────────────────────
     api_key = ""
-    if provider["env_key"]:
+    if provider.get("custom"):
+        console.print(
+            f"[bold]Step 3 of 3 — Enter your {provider['label']} API key[/bold]\n"
+        )
+        console.print(
+            "  [dim]Local servers (Ollama, LM Studio, llama.cpp, vLLM) usually need "
+            "no key — press Enter to skip.[/dim]\n"
+        )
+        api_key = Prompt.ask(
+            f"  Paste your {provider['env_key']} (optional)",
+            password=True,
+            default="",
+            console=console,
+        ).strip()
+    elif provider["env_key"]:
         console.print(f"[bold]Step 3 of 3 — Enter your {provider['label']} API key[/bold]\n")
         console.print(f"  [dim]Get your key at: {provider['note'].split('—')[-1].strip()}[/dim]")
         console.print(f"  [dim]It will only be stored locally in your .env file.[/dim]\n")
@@ -470,6 +528,8 @@ def run_setup_wizard(settings: Settings) -> Settings:
 
     if save:
         _write_env(provider["setting"], chosen_model)
+        if base_url:
+            _write_env(provider["base_url"], base_url)
         if api_key:
             _write_env(provider["env_key"], api_key)
         console.print(
@@ -479,6 +539,8 @@ def run_setup_wizard(settings: Settings) -> Settings:
     else:
         # Set in-process env so this run still works
         os.environ[provider["setting"]] = chosen_model
+        if base_url:
+            os.environ[provider["base_url"]] = base_url
         if api_key:
             os.environ[provider["env_key"]] = api_key
 
@@ -504,7 +566,8 @@ def _handle_agent_exception(exc: Exception, json_mode: bool) -> None:
             "  • Anthropic → ANTHROPIC_API_KEY\n"
             "  • OpenAI    → OPENAI_API_KEY\n"
             "  • OpenRouter → OPENROUTER_API_KEY\n"
-            "  • Ollama Cloud → OLLAMA_API_KEY"
+            "  • Ollama Cloud → OLLAMA_API_KEY\n"
+            "  • Custom endpoint → OPENAI_COMPAT_API_KEY / OPENAI_COMPAT_BASE_URL"
         )
     elif "connection refused" in exc_str or "ollama" in exc_str:
         _print_error(
@@ -537,13 +600,13 @@ def run_cli(
     Run a complete scan and drop into an interactive follow-up loop.
     """
     if model_override:
-        settings.preferred_local_model = model_override
+        settings.set_model_override(model_override)
 
     # First-run setup: no model configured and not in JSON/scripted mode
     if not output_json and not _is_configured(settings):
         settings = run_setup_wizard(settings)
         if model_override:
-            settings.preferred_local_model = model_override
+            settings.set_model_override(model_override)
 
     model_name, model_display = settings.get_active_model()
 
