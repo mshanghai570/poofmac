@@ -95,6 +95,13 @@ requires = [
 # The wrong spellings are silently ignored, producing a bundle with no
 # entitlements and a default deployment target.
 min_os_version = "12.0"
+# Build a single-architecture app for the runner's native arch instead of a
+# universal2 app. CI builds each arch on its own runner (macos-latest = arm64,
+# macos-15-intel = x86_64). A universal build makes pip resolve the same
+# universal2 wheel (e.g. charset_normalizer) into both app_packages.arm64 and
+# app_packages.x86_64, and the later lipo merge then fails with "have the same
+# architectures (x86_64) and can't be in the same fat output file".
+universal_build = false
 entitlement."com.apple.security.files.user-selected.read-write" = true
 entitlement."com.apple.security.network.client" = true
 requires = []

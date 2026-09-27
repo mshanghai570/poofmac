@@ -6,10 +6,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Intel runner — broadest compatibility with macOS 12/13 target
+  # Intel runner — broadest compatibility with macOS 12/13 target.
+  # macos-13 was retired by GitHub in Sept 2025; macos-15-intel is the
+  # replacement x86_64 image (available until Aug 2027).
   build-intel:
-    name: Build DMG (Intel / macos-13)
-    runs-on: macos-13
+    name: Build DMG (Intel / macos-15-intel)
+    runs-on: macos-15-intel
     permissions:
       contents: write
 
