@@ -193,15 +193,20 @@ class CleanerAgent:
             response = None
             for attempt in range(1, 4):  # up to 3 retries for transient errors
                 try:
-                    response = litellm.completion(
-                        model=self.model,
-                        messages=self.messages,
-                        tools=TOOLS,
-                        tool_choice="auto",
-                        temperature=0,  # Deterministic — critical for file operations
-                        max_tokens=4096,
+                    request_kwargs = {
+                        "model": self.model,
+                        "messages": self.messages,
+                        "tools": TOOLS,
+                        "tool_choice": "auto",
                         **extra_kwargs,
-                    )
+                    }
+                    # ChatGPT subscription Codex models use LiteLLM's
+                    # Responses bridge, which manages generation limits and
+                    # does not accept chat-completions sampling parameters.
+                    if not self.model.startswith("chatgpt/"):
+                        request_kwargs["temperature"] = 0  # deterministic file analysis
+                        request_kwargs["max_tokens"] = 4096
+                    response = litellm.completion(**request_kwargs)
                     break  # success — exit retry loop
                 except litellm.RateLimitError as exc:
                     yield {"type": "error", "text": f"Rate limit: {exc}. Wait a moment and retry."}

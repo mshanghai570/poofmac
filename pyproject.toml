@@ -8,7 +8,8 @@ version = "0.2.3"
 description = "PoofMac — local AI-powered Mac disk cleaner. Runs on Ollama, no subscription, no data leaves your machine."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
     { name = "lesteroliver", email = "hello@poofmac.app" },
 ]
@@ -27,7 +28,7 @@ classifiers = [
     "Topic :: Utilities",
 ]
 dependencies = [
-    "litellm>=1.35.0",
+    "litellm>=1.81.14",
     "rich>=13.7.0",
     "textual>=0.60.0",
     "pydantic-settings>=2.2.0",
@@ -51,7 +52,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
 ]
 gui = [
-    "PySide6>=6.6.0",
+    "PySide6>=6.6.0,<6.9",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -72,7 +73,6 @@ project_name = "PoofMac"
 bundle = "app.poofmac"
 version = "0.2.3"
 url = "https://poofmac.app"
-license.file = "LICENSE"
 author = "PoofMac Contributors"
 author_email = "hello@poofmac.app"
 
@@ -82,8 +82,8 @@ description = "AI-powered Mac disk cleaner with robust safety guardrails"
 icon = "assets/icon"
 sources = ["mac_cleaner"]
 requires = [
-    "PySide6-Essentials>=6.6.0",
-    "litellm>=1.35.0",
+    "PySide6-Essentials>=6.6.0,<6.9",
+    "litellm>=1.81.14",
     "pydantic-settings>=2.2.0",
     "pydantic>=2.6.0",
     "python-dotenv>=1.0.0",
@@ -104,4 +104,3 @@ min_os_version = "12.0"
 universal_build = false
 entitlement."com.apple.security.files.user-selected.read-write" = true
 entitlement."com.apple.security.network.client" = true
-requires = []

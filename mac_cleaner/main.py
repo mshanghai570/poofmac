@@ -57,6 +57,7 @@ from textual.widgets import (
 )
 
 from mac_cleaner import __version__
+from mac_cleaner.tool_cli import run_tools as _run_tools_cli
 from mac_cleaner.audit import AuditLogger
 from mac_cleaner.config import Settings
 from mac_cleaner.executor import Executor
@@ -722,6 +723,9 @@ class MacCleanerApp(App):
 
 
 def run() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "tools":
+        sys.exit(_run_tools_cli(sys.argv[2:]))
+
     parser = argparse.ArgumentParser(
         prog="poofmac",
         description="PoofMac — AI-powered Mac disk cleaner",

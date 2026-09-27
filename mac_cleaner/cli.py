@@ -312,6 +312,26 @@ _PROVIDERS = [
         "setting": "PREFERRED_CLOUD_MODEL",
     },
     {
+        "key":      "github_copilot",
+        "label":    "GitHub Copilot",
+        "note":     "Use your Copilot subscription — authenticates via GitHub device flow",
+        "env_key":  None,
+        "models":   MODEL_REGISTRY["github_copilot"],
+        "default":  "gpt-5.2",
+        "setting":  "GITHUB_COPILOT_MODEL",
+        "native_auth": True,
+    },
+    {
+        "key":      "openai_codex",
+        "label":    "OpenAI Codex (ChatGPT subscription)",
+        "note":     "Use Codex models via your ChatGPT subscription — authenticates via device flow",
+        "env_key":  None,
+        "models":   MODEL_REGISTRY["openai_codex"],
+        "default":  "gpt-5.3-codex",
+        "setting":  "OPENAI_CODEX_MODEL",
+        "native_auth": True,
+    },
+    {
         "key":     "openai",
         "label":   "OpenAI (GPT)",
         "note":    "Reliable cloud option  —  platform.openai.com",
@@ -375,20 +395,24 @@ def _write_env(key: str, value: str) -> None:
 
 
 def _is_configured(settings: Settings) -> bool:
-    """Return True if at least one usable model is configured."""
-    has_key = any([
-        settings.anthropic_api_key,
-        settings.openrouter_api_key,
-        settings.openai_api_key,
-        settings.ollama_api_key,
-        # A custom endpoint counts once its URL and model are set — the API
-        # key is optional on local servers
-        (settings.openai_compat_base_url and settings.openai_compat_model),
-    ])
-    # A local model is usable without a key (Ollama local)
-    local = settings.preferred_local_model
-    has_local = bool(local) and not local.endswith("-cloud") and "cloud" not in local
-    return has_key or has_local
+    """Return whether the selected backend has enough configuration to start."""
+    provider = settings.get_active_provider()
+    if provider in ("github_copilot", "openai_codex"):
+        # LiteLLM prompts for the provider's OAuth device flow on first use.
+        return True
+    if provider == "openai_compat":
+        return bool(settings.openai_compat_base_url and settings.openai_compat_model)
+    if provider == "anthropic":
+        return bool(settings.anthropic_api_key)
+    if provider == "openrouter":
+        return bool(settings.openrouter_api_key)
+    if provider == "openai":
+        return bool(settings.openai_api_key)
+    if provider == "ollama_cloud":
+        return bool(settings.ollama_api_key)
+    if provider == "ollama_local":
+        return bool(settings.preferred_local_model)
+    return False
 
 
 def run_setup_wizard(settings: Settings) -> Settings:
@@ -476,9 +500,15 @@ def run_setup_wizard(settings: Settings) -> Settings:
 
         console.print(f"\n  [green]✓[/green]  Selected: [bold]{chosen_desc}[/bold]\n")
 
-    # ── Step 3: API key (skip for local Ollama) ───────────────────────────────
+    # ── Step 3: credentials / native OAuth / local Ollama ─────────────────────
     api_key = ""
-    if provider.get("custom"):
+    if provider.get("native_auth"):
+        console.print(
+            "[bold]Step 3 of 3 — Sign in on first use[/bold]\n"
+            "  LiteLLM will display a verification URL and device code the first "
+            "time you run a scan. No API key is required.\n"
+        )
+    elif provider.get("custom"):
         console.print(
             f"[bold]Step 3 of 3 — Enter your {provider['label']} API key[/bold]\n"
         )
@@ -527,10 +557,11 @@ def run_setup_wizard(settings: Settings) -> Settings:
     )
 
     if save:
+        _write_env("ACTIVE_PROVIDER", provider["key"])
         _write_env(provider["setting"], chosen_model)
         if base_url:
             _write_env(provider["base_url"], base_url)
-        if api_key:
+        if api_key and provider.get("env_key"):
             _write_env(provider["env_key"], api_key)
         console.print(
             f"\n  [green]✓[/green]  Saved to [bold].env[/bold] — "
@@ -538,17 +569,34 @@ def run_setup_wizard(settings: Settings) -> Settings:
         )
     else:
         # Set in-process env so this run still works
+        os.environ["ACTIVE_PROVIDER"] = provider["key"]
+        settings.active_provider = provider["key"]
         os.environ[provider["setting"]] = chosen_model
         if base_url:
             os.environ[provider["base_url"]] = base_url
-        if api_key:
+        if api_key and provider.get("env_key"):
             os.environ[provider["env_key"]] = api_key
 
-    # Reload settings so the new values take effect
+    # Reload settings so the new values take effect, including this selection
+    # when the wizard was run against an existing in-memory Settings instance.
     try:
-        return Settings(_env_file=str(_ENV_PATH))  # type: ignore[call-arg]
+        configured = Settings(_env_file=str(_ENV_PATH))  # type: ignore[call-arg]
     except Exception:
-        return Settings()
+        configured = Settings()
+    configured.active_provider = provider["key"]
+    if provider["setting"] == "PREFERRED_CLOUD_MODEL":
+        configured.preferred_cloud_model = chosen_model
+    elif provider["setting"] == "PREFERRED_LOCAL_MODEL":
+        configured.preferred_local_model = chosen_model
+    elif provider["setting"] == "GITHUB_COPILOT_MODEL":
+        configured.github_copilot_model = chosen_model
+    elif provider["setting"] == "OPENAI_CODEX_MODEL":
+        configured.openai_codex_model = chosen_model
+    if base_url:
+        configured.openai_compat_base_url = base_url
+    if api_key and provider.get("env_key") == "OPENAI_COMPAT_API_KEY":
+        configured.openai_compat_api_key = api_key
+    return configured
 
 
 def _print_error(msg: str) -> None:

@@ -56,8 +56,10 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QStackedWidget,
     QTabWidget,
@@ -69,7 +71,7 @@ from PySide6.QtWidgets import (
 )
 
 from mac_cleaner.audit import AuditLogger
-from mac_cleaner.config import MODEL_REGISTRY, Settings
+from mac_cleaner.config import MODEL_REGISTRY, Settings, discover_openai_compat_models
 from mac_cleaner.executor import Executor
 from mac_cleaner.llm import CleanerAgent
 from mac_cleaner.scanner import format_size, get_disk_usage
@@ -78,6 +80,17 @@ from mac_cleaner.scanner import format_size, get_disk_usage
 
 CLOUD_MODELS = [m for m, _ in MODEL_REGISTRY["ollama_cloud"]]
 LOCAL_MODELS_KNOWN = [m for m, _ in MODEL_REGISTRY["ollama_local"]]
+PROVIDER_LABELS = {
+    "auto": "Automatic",
+    "anthropic": "Anthropic",
+    "openrouter": "OpenRouter",
+    "openai": "OpenAI",
+    "github_copilot": "GitHub Copilot",
+    "openai_codex": "OpenAI Codex",
+    "openai_compat": "Custom",
+    "ollama_cloud": "Ollama Cloud",
+    "ollama_local": "Ollama Local",
+}
 
 # ── Category visual metadata ──────────────────────────────────────────────────
 
@@ -648,6 +661,22 @@ class AgentWorker(QThread):
             self.event_emitted.emit({"type": "error", "text": str(exc)})
 
 
+class OpenAICompatModelsWorker(QThread):
+    """Fetch model IDs without blocking the GUI thread."""
+
+    models_ready = Signal(list)
+
+    def __init__(self, base_url: str, api_key: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.base_url = base_url
+        self.api_key = api_key
+
+    def run(self) -> None:
+        self.models_ready.emit(
+            discover_openai_compat_models(self.base_url, self.api_key)
+        )
+
+
 class ExecutionWorker(QThread):
     """Runs file deletions in a background thread."""
 
@@ -872,9 +901,11 @@ class SettingsDialog(QDialog):
         # Set after a save when the active provider/model actually changed, so
         # the main window can drop its cached agent and pick up the new model.
         self.provider_changed = False
+        self._compat_models_worker: Optional[OpenAICompatModelsWorker] = None
+        self._compat_refresh_pending = False
         self.setWindowTitle("PoofMac Settings")
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
-        self.setFixedSize(560, 540)
+        self.setFixedSize(680, 700)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 20, 20, 16)
@@ -889,7 +920,10 @@ class SettingsDialog(QDialog):
         tabs = QTabWidget()
         tabs.addTab(self._build_api_tab(), "API Keys")
         tabs.addTab(self._build_compat_tab(), "Custom")
-        tabs.addTab(self._build_models_tab(), "Models")
+        models_scroll = QScrollArea()
+        models_scroll.setWidgetResizable(True)
+        models_scroll.setWidget(self._build_models_tab())
+        tabs.addTab(models_scroll, "Models")
         tabs.addTab(self._build_safety_tab(), "Safety")
         root.addWidget(tabs, stretch=1)
 
@@ -989,11 +1023,12 @@ class SettingsDialog(QDialog):
             "qwen3.6:27b  ·  llama3.1-8b-instruct  ·  deepseek-chat"
         )
         layout.addWidget(self._compat_model_edit)
+        self._compat_model_edit.textChanged.connect(self._sync_compat_model_combo)
 
         note = QLabel(
             "Saved to .env as OPENAI_COMPAT_BASE_URL / OPENAI_COMPAT_API_KEY / "
-            "OPENAI_COMPAT_MODEL. This provider is used only when the Anthropic, "
-            "OpenRouter and OpenAI keys are all empty."
+            "OPENAI_COMPAT_MODEL. Select Custom OpenAI-compatible endpoint in "
+            "Settings → Models to use it even when other provider keys are saved."
         )
         note.setWordWrap(True)
         note.setStyleSheet(
@@ -1009,23 +1044,94 @@ class SettingsDialog(QDialog):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
 
+        layout.addWidget(QLabel("Active provider"))
+        self._active_provider_combo = QComboBox()
+        self._active_provider_labels = {
+            "auto": "Automatic (use configured credentials)",
+            "anthropic": "Anthropic",
+            "openrouter": "OpenRouter",
+            "openai": "OpenAI",
+            "github_copilot": "GitHub Copilot",
+            "openai_codex": "OpenAI Codex (ChatGPT subscription)",
+            "openai_compat": "Custom OpenAI-compatible endpoint",
+            "ollama_cloud": "Ollama Cloud",
+            "ollama_local": "Ollama Local",
+        }
+        for provider_id, label in self._active_provider_labels.items():
+            self._active_provider_combo.addItem(label, provider_id)
+        active_provider = self.settings.active_provider
+        provider_index = self._active_provider_combo.findData(active_provider)
+        self._active_provider_combo.setCurrentIndex(max(0, provider_index))
+        layout.addWidget(self._active_provider_combo)
+
         layout.addWidget(QLabel("Cloud model (Anthropic / OpenRouter / OpenAI)"))
         self._cloud_model_combo = QComboBox()
-        all_cloud: list[str] = []
         for provider_key in ("anthropic", "openai", "openrouter"):
             self._cloud_model_combo.addItem(f"── {provider_key.capitalize()} ──")
             model_count = self._cloud_model_combo.count()
             self._cloud_model_combo.model().item(model_count - 1).setEnabled(False)
             for m, label in MODEL_REGISTRY[provider_key]:
-                self._cloud_model_combo.addItem(f"{m}  —  {label.split('—')[-1].strip()}", m)
-                all_cloud.append(m)
+                self._cloud_model_combo.addItem(
+                    f"{m}  —  {label.split('—')[-1].strip()}", (provider_key, m)
+                )
                 if m == self.settings.preferred_cloud_model:
                     self._cloud_model_combo.setCurrentIndex(self._cloud_model_combo.count() - 1)
+        self._cloud_model_combo.currentIndexChanged.connect(self._on_cloud_model_selected)
         layout.addWidget(self._cloud_model_combo)
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("GitHub Copilot model (uses your Copilot subscription)"))
+        self._copilot_model_combo = QComboBox()
+        self._copilot_model_combo.setEditable(True)
+        for m, label in MODEL_REGISTRY["github_copilot"]:
+            self._copilot_model_combo.addItem(f"{m}  —  {label.split('(')[-1].rstrip(')')}", m)
+        self._copilot_model_combo.setCurrentText(self.settings.github_copilot_model)
+        self._copilot_model_combo.currentTextChanged.connect(
+            lambda _text: self._select_active_provider("github_copilot")
+        )
+        layout.addWidget(self._copilot_model_combo)
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("OpenAI Codex model (uses your ChatGPT subscription)"))
+        self._codex_model_combo = QComboBox()
+        self._codex_model_combo.setEditable(True)
+        for model_id, label in MODEL_REGISTRY["openai_codex"]:
+            self._codex_model_combo.addItem(f"{model_id}  —  {label.split('(')[-1].rstrip(')')}", model_id)
+        self._codex_model_combo.setCurrentText(self.settings.openai_codex_model)
+        self._codex_model_combo.currentTextChanged.connect(
+            lambda _text: self._select_active_provider("openai_codex")
+        )
+        layout.addWidget(self._codex_model_combo)
+
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("Custom endpoint model (discovered from /models; editable)"))
+        compat_model_row = QHBoxLayout()
+        self._compat_model_combo = QComboBox()
+        self._compat_model_combo.setEditable(True)
+        self._compat_model_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._compat_refresh_pending = False
+        self._compat_model_combo.currentTextChanged.connect(
+            self._on_compat_model_selected
+        )
+        compat_model_row.addWidget(self._compat_model_combo, stretch=1)
+        self._compat_refresh_button = _btn("Refresh", "secondary")
+        self._compat_refresh_button.clicked.connect(self._refresh_compat_model_choices)
+        compat_model_row.addWidget(self._compat_refresh_button)
+        layout.addLayout(compat_model_row)
+        if self.settings.openai_compat_model:
+            self._compat_model_combo.addItem(
+                self.settings.openai_compat_model, self.settings.openai_compat_model
+            )
+            self._compat_model_combo.setCurrentText(self.settings.openai_compat_model)
+        self._compat_base_edit.textChanged.connect(self._maybe_refresh_compat_models)
+        self._compat_key_edit.textChanged.connect(self._maybe_refresh_compat_models)
+        if self._compat_base_edit.text().strip():
+            self._refresh_compat_model_choices()
 
         layout.addSpacing(8)
         layout.addWidget(QLabel("Ollama cloud model (requires Ollama subscription)"))
         self._ollama_cloud_combo = QComboBox()
+        self._ollama_cloud_combo.setCurrentIndex(-1)
         for m, label in MODEL_REGISTRY["ollama_cloud"]:
             self._ollama_cloud_combo.addItem(f"{m}  —  {label.split('—')[-1].strip()}", m)
             if m == self.settings.preferred_local_model:
@@ -1035,6 +1141,7 @@ class SettingsDialog(QDialog):
         layout.addSpacing(8)
         layout.addWidget(QLabel("Ollama local model (runs on your Mac, no internet)"))
         self._ollama_local_combo = QComboBox()
+        self._ollama_local_combo.setCurrentIndex(-1)
         for m, label in MODEL_REGISTRY["ollama_local"]:
             self._ollama_local_combo.addItem(f"{m}  —  {label.split('(')[0].strip()}", m)
             if m == self.settings.preferred_local_model:
@@ -1042,16 +1149,124 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._ollama_local_combo)
 
         note = QLabel(
-            "The active model is chosen automatically based on which API key is set. "
-            "If no key is set, the Ollama model is used."
+            "Choose an active provider above, then choose its model. Automatic keeps "
+            "the legacy API-key priority. Custom endpoint model IDs can be refreshed "
+            "from its /models API or entered manually."
         )
         note.setWordWrap(True)
         note.setStyleSheet(
             f"font-size: 11px; color: {self.t.text_tertiary}; background: transparent;"
         )
         layout.addWidget(note)
+        self._active_provider_combo.currentIndexChanged.connect(
+            self._on_active_provider_changed
+        )
+        self._ollama_cloud_combo.currentIndexChanged.connect(
+            lambda _index: self._select_active_provider("ollama_cloud")
+        )
+        self._ollama_local_combo.currentIndexChanged.connect(
+            lambda _index: self._select_active_provider("ollama_local")
+        )
         layout.addStretch()
         return w
+
+    def _select_active_provider(self, provider_id: str) -> None:
+        index = self._active_provider_combo.findData(provider_id)
+        if index >= 0 and self._active_provider_combo.currentIndex() != index:
+            self._active_provider_combo.setCurrentIndex(index)
+
+    def _on_cloud_model_selected(self, index: int) -> None:
+        selected = self._cloud_model_combo.itemData(index)
+        if isinstance(selected, tuple) and len(selected) == 2:
+            self._select_active_provider(selected[0])
+
+    def _on_active_provider_changed(self, _index: int) -> None:
+        provider_id = self._active_provider_combo.currentData()
+        if provider_id in ("anthropic", "openai", "openrouter"):
+            selected_index = -1
+            for index in range(self._cloud_model_combo.count()):
+                selected = self._cloud_model_combo.itemData(index)
+                if isinstance(selected, tuple) and selected[0] == provider_id:
+                    selected_index = index
+                    if selected[1] == self.settings.preferred_cloud_model:
+                        break
+            if selected_index >= 0:
+                self._cloud_model_combo.setCurrentIndex(selected_index)
+        elif provider_id == "openai_compat":
+            if self._compat_base_edit.text().strip():
+                self._refresh_compat_model_choices()
+        elif provider_id == "ollama_cloud" and self._ollama_cloud_combo.currentIndex() < 0:
+            self._ollama_cloud_combo.setCurrentIndex(0)
+        elif provider_id == "ollama_local" and self._ollama_local_combo.currentIndex() < 0:
+            self._ollama_local_combo.setCurrentIndex(0)
+
+    def _on_compat_model_selected(self, model_id: str) -> None:
+        model_id = model_id.strip()
+        if model_id != self._compat_model_edit.text():
+            self._compat_model_edit.setText(model_id)
+        if model_id:
+            self._select_active_provider("openai_compat")
+
+    def _sync_compat_model_combo(self, model_id: str) -> None:
+        if self._compat_model_combo.currentText() == model_id:
+            return
+        self._compat_model_combo.blockSignals(True)
+        self._compat_model_combo.setEditText(model_id)
+        self._compat_model_combo.blockSignals(False)
+
+    def _maybe_refresh_compat_models(self, _text: str) -> None:
+        if self._compat_base_edit.text().strip():
+            self._refresh_compat_model_choices()
+
+    def _refresh_compat_model_choices(self) -> None:
+        base_url = self._compat_base_edit.text().strip()
+        if not base_url:
+            return
+        if self._compat_models_worker and self._compat_models_worker.isRunning():
+            # Coalesce endpoint edits into one fetch with the latest values.
+            self._compat_refresh_pending = True
+            return
+        self._compat_refresh_pending = False
+        self._compat_refresh_button.setEnabled(False)
+        worker = OpenAICompatModelsWorker(
+            base_url, self._compat_key_edit.text(), self
+        )
+        self._compat_models_worker = worker
+        worker.models_ready.connect(self._set_compat_model_choices)
+        worker.finished.connect(self._on_compat_model_refresh_finished)
+        worker.finished.connect(
+            lambda w=worker: setattr(self, "_compat_models_worker", None)
+            if self._compat_models_worker is w else None
+        )
+        worker.start()
+
+    def _on_compat_model_refresh_finished(self) -> None:
+        self._compat_refresh_button.setEnabled(True)
+        if self._compat_refresh_pending:
+            self._refresh_compat_model_choices()
+
+    def _set_compat_model_choices(self, discovered: list[str]) -> None:
+        current = self._compat_model_combo.currentText().strip()
+        models = list(discovered)
+        if current and current not in models:
+            models.append(current)
+        self._compat_model_combo.blockSignals(True)
+        self._compat_model_combo.clear()
+        for model_id in models:
+            self._compat_model_combo.addItem(model_id, model_id)
+        if current in models:
+            self._compat_model_combo.setCurrentIndex(models.index(current))
+        else:
+            self._compat_model_combo.setEditText(current)
+        self._compat_model_combo.blockSignals(False)
+        if self._compat_model_edit.text() != current:
+            self._compat_model_edit.setText(current)
+
+    def closeEvent(self, event) -> None:
+        worker = self._compat_models_worker
+        if worker and worker.isRunning():
+            worker.wait()
+        super().closeEvent(event)
 
     def _build_safety_tab(self) -> QWidget:
         w = QWidget()
@@ -1079,6 +1294,29 @@ class SettingsDialog(QDialog):
     # ── Save ───────────────────────────────────────────────────────────────────
 
     def _save_and_close(self) -> None:
+        selected_provider = self._active_provider_combo.currentData() or "auto"
+        if selected_provider in ("anthropic", "openai", "openrouter"):
+            key_edits = {
+                "anthropic": self._anthropic_edit,
+                "openai": self._openai_edit,
+                "openrouter": self._openrouter_edit,
+            }
+            if not key_edits[selected_provider].text().strip():
+                QMessageBox.warning(
+                    self,
+                    "Provider API key required",
+                    f"Add a {selected_provider.capitalize()} API key in the API Keys tab before selecting it.",
+                )
+                return
+        if selected_provider == "openai_compat":
+            model = self._compat_model_edit.text().strip() or self._compat_model_combo.currentText().strip()
+            if not self._compat_base_edit.text().strip() or not model:
+                QMessageBox.warning(
+                    self,
+                    "Custom provider is incomplete",
+                    "Enter a custom provider Base URL and Model ID before selecting it.",
+                )
+                return
         try:
             try:
                 prev_active = self.settings.get_active_model()
@@ -1088,6 +1326,11 @@ class SettingsDialog(QDialog):
             from dotenv import find_dotenv, set_key
             env_path = find_dotenv(usecwd=True) or ".env"
 
+            # Persist explicit provider choice. "auto" retains legacy priority.
+            active_provider = self._active_provider_combo.currentData() or "auto"
+            set_key(env_path, "ACTIVE_PROVIDER", active_provider)
+            self.settings.active_provider = active_provider
+
             # API keys
             set_key(env_path, "ANTHROPIC_API_KEY", self._anthropic_edit.text().strip())
             set_key(env_path, "OPENROUTER_API_KEY", self._openrouter_edit.text().strip())
@@ -1096,7 +1339,10 @@ class SettingsDialog(QDialog):
             # OpenAI-compatible endpoint (Custom tab)
             compat_base = self._compat_base_edit.text().strip().rstrip("/")
             compat_key = self._compat_key_edit.text().strip()
-            compat_model = self._compat_model_edit.text().strip()
+            compat_model = (
+                self._compat_model_edit.text().strip()
+                or self._compat_model_combo.currentText().strip()
+            )
             set_key(env_path, "OPENAI_COMPAT_BASE_URL", compat_base)
             set_key(env_path, "OPENAI_COMPAT_API_KEY", compat_key)
             set_key(env_path, "OPENAI_COMPAT_MODEL", compat_model)
@@ -1104,21 +1350,40 @@ class SettingsDialog(QDialog):
             self.settings.openai_compat_api_key = compat_key
             self.settings.openai_compat_model = compat_model
 
-            # Cloud model
-            cloud_idx = self._cloud_model_combo.currentIndex()
-            cloud_data = self._cloud_model_combo.itemData(cloud_idx)
-            if cloud_data:
-                set_key(env_path, "PREFERRED_CLOUD_MODEL", cloud_data)
-                self.settings.preferred_cloud_model = cloud_data
+            # Save selected model names, including custom/discovered models.
+            codex_model = self._codex_model_combo.currentText().strip()
+            if codex_model:
+                set_key(env_path, "OPENAI_CODEX_MODEL", codex_model)
+                self.settings.openai_codex_model = codex_model
 
-            # Local model (prefer cloud tab, fallback to local tab)
-            ollama_cloud_data = self._ollama_cloud_combo.itemData(
-                self._ollama_cloud_combo.currentIndex()
-            )
-            ollama_local_data = self._ollama_local_combo.itemData(
-                self._ollama_local_combo.currentIndex()
-            )
-            preferred_local = ollama_cloud_data or ollama_local_data or ""
+            copilot_model = self._copilot_model_combo.currentText().strip()
+            if copilot_model:
+                set_key(env_path, "GITHUB_COPILOT_MODEL", copilot_model)
+                self.settings.github_copilot_model = copilot_model
+
+            # Cloud model (only the model belonging to the active provider).
+            cloud_data = self._cloud_model_combo.currentData()
+            if (
+                isinstance(cloud_data, tuple)
+                and len(cloud_data) == 2
+                and active_provider == cloud_data[0]
+            ):
+                cloud_model = cloud_data[1]
+                set_key(env_path, "PREFERRED_CLOUD_MODEL", cloud_model)
+                self.settings.preferred_cloud_model = cloud_model
+
+            # Save the Ollama model matching the chosen Ollama provider only;
+            # unrelated combo boxes must not overwrite a user's saved model.
+            ollama_cloud_data = self._ollama_cloud_combo.currentData()
+            ollama_local_data = self._ollama_local_combo.currentData()
+            ollama_provider = active_provider
+            if ollama_provider == "auto":
+                ollama_provider = self.settings.get_active_provider()
+            preferred_local = ""
+            if ollama_provider == "ollama_cloud":
+                preferred_local = ollama_cloud_data or self.settings.preferred_local_model
+            elif ollama_provider == "ollama_local":
+                preferred_local = ollama_local_data or self.settings.preferred_local_model
             if preferred_local:
                 set_key(env_path, "PREFERRED_LOCAL_MODEL", preferred_local)
                 self.settings.preferred_local_model = preferred_local
@@ -1127,13 +1392,10 @@ class SettingsDialog(QDialog):
             set_key(env_path, "SAFE_MODE", str(self._safe_mode_check.isChecked()).lower())
             self.settings.safe_mode = self._safe_mode_check.isChecked()
 
-            # Update API keys on the settings object
-            if self._anthropic_edit.text().strip():
-                self.settings.anthropic_api_key = self._anthropic_edit.text().strip()
-            if self._openrouter_edit.text().strip():
-                self.settings.openrouter_api_key = self._openrouter_edit.text().strip()
-            if self._openai_edit.text().strip():
-                self.settings.openai_api_key = self._openai_edit.text().strip()
+            # Update API keys on the settings object, including clearing keys.
+            self.settings.anthropic_api_key = self._anthropic_edit.text().strip()
+            self.settings.openrouter_api_key = self._openrouter_edit.text().strip()
+            self.settings.openai_api_key = self._openai_edit.text().strip()
 
             try:
                 new_active = self.settings.get_active_model()
@@ -1179,6 +1441,8 @@ class PoofMacWindow(QMainWindow):
         # Persistent chat agent — reused across follow-up messages so the AI
         # remembers previous context ("now delete those", "what about logs?")
         self._chat_agent: Optional[CleanerAgent] = None
+        self._model_picker_generation = 0
+        self._compat_models_workers: list[OpenAICompatModelsWorker] = []
 
         self.setWindowTitle("PoofMac")
         self.setMinimumSize(960, 640)
@@ -1418,29 +1682,64 @@ class PoofMacWindow(QMainWindow):
         self.model_combo.clear()
         mdl = self.model_combo.model()
 
-        try:
-            _, display = self.settings.get_active_model()
-            if any(x in display for x in ("(Anthropic)", "(OpenRouter)", "(OpenAI)", "(Custom")):
-                self.model_combo.addItem(f"✓ {display}")
-                self.model_combo.insertSeparator(1)
-        except RuntimeError:
-            pass
+        active_provider = self.settings.get_active_provider()
+        current_models = {
+            "anthropic": self.settings.preferred_cloud_model,
+            "openai": self.settings.preferred_cloud_model,
+            "openrouter": self.settings.preferred_cloud_model,
+            "github_copilot": self.settings.github_copilot_model,
+            "openai_codex": self.settings.openai_codex_model,
+            "openai_compat": self.settings.openai_compat_model,
+            "ollama_cloud": self.settings.preferred_local_model,
+            "ollama_local": self.settings.preferred_local_model,
+        }
+        current_model = current_models.get(active_provider, "")
 
-        current = self.settings.preferred_local_model
+        for provider_id in ("anthropic", "openai", "openrouter", "github_copilot", "openai_codex"):
+            provider_label = PROVIDER_LABELS[provider_id]
+            self.model_combo.addItem(f"── {provider_label} ──")
+            mdl.item(self.model_combo.count() - 1).setEnabled(False)
+            for model_id, _ in MODEL_REGISTRY[provider_id]:
+                self.model_combo.addItem(
+                    f"{model_id}  ({provider_label})", (provider_id, model_id)
+                )
+                if active_provider == provider_id and current_model == model_id:
+                    self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
+
+        # Always expose the saved custom model, even if the endpoint is currently
+        # unreachable. Discovery below adds any additional models after population.
+        custom_models = [self.settings.openai_compat_model.strip()]
+        if active_provider == "openai_compat" and not self.settings.openai_compat_base_url.strip():
+            self.model_combo.addItem("── Custom endpoint ──")
+            mdl.item(self.model_combo.count() - 1).setEnabled(False)
+            for model_id in (model for model in custom_models if model):
+                self.model_combo.addItem(
+                    f"{model_id}  (Custom)", ("openai_compat", model_id)
+                )
+                self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
+        self._model_picker_generation += 1
+        generation = self._model_picker_generation
+        # The custom selection has its own per-endpoint model ID and must always
+        # remain selectable even when discovery fails or returns no rows.
+        self._append_custom_model_choices(
+            [model for model in custom_models if model],
+            active_provider,
+            current_model,
+            generation,
+        )
 
         self.model_combo.addItem("── Ollama Cloud ──")
         mdl.item(self.model_combo.count() - 1).setEnabled(False)
-        for m in CLOUD_MODELS:
-            self.model_combo.addItem(m)
-            if m == current:
+        for model_id in CLOUD_MODELS:
+            self.model_combo.addItem(model_id, ("ollama_cloud", model_id))
+            if active_provider == "ollama_cloud" and current_model == model_id:
                 self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
 
-        self.model_combo.insertSeparator(self.model_combo.count())
         self.model_combo.addItem("── Ollama Local (recommended) ──")
         mdl.item(self.model_combo.count() - 1).setEnabled(False)
-        for m in LOCAL_MODELS_KNOWN:
-            self.model_combo.addItem(m)
-            if m == current:
+        for model_id in LOCAL_MODELS_KNOWN:
+            self.model_combo.addItem(model_id, ("ollama_local", model_id))
+            if active_provider == "ollama_local" and current_model == model_id:
                 self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
 
         local_installed = [
@@ -1452,10 +1751,66 @@ class PoofMacWindow(QMainWindow):
             self.model_combo.addItem("── Ollama Local (installed) ──")
             mdl.item(self.model_combo.count() - 1).setEnabled(False)
             for m in local_installed:
-                self.model_combo.addItem(m)
-                if m == current:
+                self.model_combo.addItem(m, ("ollama_local", m))
+                if active_provider == "ollama_local" and m == current_model:
                     self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
 
+        self.model_combo.blockSignals(False)
+
+        # Fetch only after the picker is fully populated so fast local responses
+        # cannot select or append into a half-built combo box.
+        if self.settings.openai_compat_base_url.strip():
+            worker = OpenAICompatModelsWorker(
+                self.settings.openai_compat_base_url,
+                self.settings.openai_compat_api_key,
+                self,
+            )
+            self._compat_models_workers.append(worker)
+            worker.models_ready.connect(
+                lambda models, provider=active_provider, selected=current_model, gen=generation:
+                    self._append_custom_model_choices(models, provider, selected, gen)
+            )
+            worker.finished.connect(
+                lambda w=worker: self._compat_models_workers.remove(w)
+                if w in self._compat_models_workers else None
+            )
+            worker.start()
+
+    def _append_custom_model_choices(
+        self,
+        models: list[str],
+        active_provider: str,
+        current_model: str,
+        generation: int,
+    ) -> None:
+        if generation != self._model_picker_generation:
+            return
+        model_ids = sorted(set(models), key=str.casefold)
+        if not model_ids and not current_model:
+            return
+        self.model_combo.blockSignals(True)
+        existing = {
+            data[1]
+            for index in range(self.model_combo.count())
+            if isinstance((data := self.model_combo.itemData(index)), tuple)
+            and len(data) == 2
+            and data[0] == "openai_compat"
+        }
+        if model_ids and not existing:
+            self.model_combo.addItem("── Custom endpoint ──")
+            self.model_combo.model().item(self.model_combo.count() - 1).setEnabled(False)
+        for model_id in model_ids:
+            if model_id not in existing:
+                self.model_combo.addItem(
+                    f"{model_id}  (Custom)", ("openai_compat", model_id)
+                )
+                existing.add(model_id)
+        if active_provider == "openai_compat" and current_model in existing:
+            target = ("openai_compat", current_model)
+            for index in range(self.model_combo.count()):
+                if self.model_combo.itemData(index) == target:
+                    self.model_combo.setCurrentIndex(index)
+                    break
         self.model_combo.blockSignals(False)
 
     @staticmethod
@@ -1471,11 +1826,49 @@ class PoofMacWindow(QMainWindow):
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return []
 
+    def _update_compat_model_edit(self, model_id: str) -> None:
+        if self._compat_model_edit.text() == model_id:
+            return
+        self._compat_model_edit.blockSignals(True)
+        self._compat_model_edit.setText(model_id)
+        self._compat_model_edit.blockSignals(False)
+        self._compat_model_combo.blockSignals(True)
+        self._compat_model_combo.setEditText(model_id)
+        self._compat_model_combo.blockSignals(False)
+
     def _on_model_changed(self, text: str) -> None:
         if not text or text.startswith("──") or text.startswith("✓"):
             return
-        model_name = text.split(" (")[0].strip()
-        self.settings.preferred_local_model = model_name
+        selected = self.model_combo.currentData()
+        if isinstance(selected, tuple) and len(selected) == 2:
+            provider_id, model_name = selected
+            self.settings.active_provider = provider_id
+            if provider_id == "github_copilot":
+                self.settings.github_copilot_model = model_name
+                env_key = "GITHUB_COPILOT_MODEL"
+            elif provider_id == "openai_codex":
+                self.settings.openai_codex_model = model_name
+                env_key = "OPENAI_CODEX_MODEL"
+            elif provider_id == "openai_compat":
+                self.settings.openai_compat_model = model_name
+                self._update_compat_model_edit(model_name)
+                env_key = "OPENAI_COMPAT_MODEL"
+            elif provider_id in ("anthropic", "openai", "openrouter"):
+                self.settings.preferred_cloud_model = model_name
+                env_key = "PREFERRED_CLOUD_MODEL"
+            else:
+                self.settings.preferred_local_model = model_name
+                env_key = "PREFERRED_LOCAL_MODEL"
+            try:
+                from dotenv import find_dotenv, set_key
+                set_key(find_dotenv(usecwd=True) or ".env", "ACTIVE_PROVIDER", provider_id)
+                set_key(find_dotenv(usecwd=True) or ".env", env_key, model_name)
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            model_name = text.split(" (")[0].strip()
+            self.settings.preferred_local_model = model_name
+        self._chat_agent = None
         self._log(
             f'<span style="color:{self.t.accent};">Model → <b>{model_name}</b></span>'
         )
@@ -1876,6 +2269,12 @@ class PoofMacWindow(QMainWindow):
         self._log(
             f'<span style="color:{self.t.orange};">Safe mode <b>{state}</b></span>'
         )
+
+    def closeEvent(self, event) -> None:
+        for worker in self._compat_models_workers:
+            if worker.isRunning():
+                worker.wait()
+        super().closeEvent(event)
 
     def _open_settings(self) -> None:
         dlg = SettingsDialog(self.settings, self.t, self)

@@ -190,7 +190,26 @@ OPENAI_COMPAT_MODEL=qwen3.6:27b                   # exactly as the endpoint list
 
 The same three settings live under **Settings → Custom** in the desktop GUI, and
 the setup wizard offers it as "OpenAI-compatible (custom endpoint)" on first run.
-It is used whenever no Anthropic / OpenRouter / OpenAI key is set.
+Select **Custom OpenAI-compatible endpoint** in **Settings → Models** to use it even when other provider keys are also configured. In the Models tab or main model selector, the model list is fetched from the endpoint's `/models` API when available; you can enter an ID manually if discovery is unsupported.
+
+### Copilot and Codex
+
+In **Settings → Models**, select GitHub Copilot or OpenAI Codex (ChatGPT subscription), then choose a model. LiteLLM prompts for its OAuth device sign-in on the first request; a CLI executable is not required for these model backends. The desktop model menu also includes these models once selected.
+
+### External coding-agent CLIs
+
+PoofMac can launch installed agent CLIs and register other commands:
+
+```bash
+poofmac tools list
+poofmac tools run copilot          # GitHub Copilot CLI
+poofmac tools run codex            # OpenAI Codex CLI
+poofmac tools add aider aider      # register another CLI
+poofmac tools run aider -- --help
+poofmac tools remove aider
+```
+
+Copilot and Codex executables must already be installed and available on `PATH`. Custom tool registrations are saved per user under `~/.config/poofmac/tools.json`; commands run directly without a shell.
 
 ---
 
