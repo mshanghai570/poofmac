@@ -1,0 +1,52 @@
+name: Handle Release Packaging
+
+on:
+  workflow_run:
+    workflows: ["Build macOS DMG"]
+    types:
+      - completed
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 1. Download Intel Zip File
+      - name: Download Intel Zip Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PoofMac-main-macOS-Intel.zip
+          path: ./compressed_assets/intel
+
+      # 2. Download Apple Silicon Zip File
+      - name: Download Apple Silicon Zip Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: PoofMac-main-macOS-AppleSilicon.zip
+          path: ./compressed_assets/silicon
+
+      # 3. Extract the archives to retrieve the .dmg installers
+      - name: Unzip Artifacts
+        run: |
+          mkdir -p ./extracted_dmgs
+          find ./compressed_assets -name "*.zip" -exec unzip -j {} -d ./extracted_dmgs/ \;
+          echo "=== Extracted Assets ==="
+          ls -la ./extracted_dmgs/
+
+      # 4. Generate the GitHub Release and upload both DMGs simultaneously
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.event.workflow_run.run_number }}"
+          echo "Publishing Release $TAG with installers..."
+          gh release create "$TAG" ./extracted_dmgs/*.dmg \
+            --title "Release $TAG" \
+            --generate-notes
