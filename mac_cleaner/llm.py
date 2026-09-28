@@ -23,6 +23,7 @@ Event types yielded
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import time
@@ -40,6 +41,68 @@ litellm.set_verbose = False  # suppress noisy debug output
 def _origin_sig() -> str:
     """Return a 16-char provenance token stored in every audit entry."""
     return hashlib.sha256(b"PoofMac-Original-2026").hexdigest()[:16]
+
+
+def _strip_provider_prefix(model: str) -> str:
+    """``openai/nex-agi/x:free`` → ``nex-agi/x:free``, for display only."""
+    for prefix in ("openai/", "openrouter/", "ollama/", "github_copilot/", "chatgpt/"):
+        if model.startswith(prefix):
+            return model[len(prefix):]
+    return model
+
+
+# LiteLLM wraps a provider's error body in its own exception text; these are the
+# wrappers worth peeling off before showing the message to a user.
+_ERROR_WRAPPERS = (
+    "litellm.NotFoundError:",
+    "litellm.BadRequestError:",
+    "litellm.AuthenticationError:",
+    "OpenAIException -",
+    "NotFoundError:",
+    "BadRequestError:",
+    "AuthenticationError:",
+)
+
+
+def _endpoint_quote(raw: object) -> str:
+    """The endpoint's own words, without LiteLLM's exception wrapper.
+
+    A gateway 404 arrives as ``litellm.NotFoundError: OpenAIException -
+    {'error': "The requested model … does not exist", …}``. Quoting that at the
+    user reads like a crash, so unwrap it down to the sentence the endpoint
+    actually wrote, and cap the length.
+    """
+    text = " ".join(str(raw or "").split())
+    while True:
+        for wrapper in _ERROR_WRAPPERS:
+            if text.startswith(wrapper):
+                text = text[len(wrapper):].lstrip()
+                break
+        else:
+            break
+
+    if "{" in text and "}" in text:
+        body = text[text.find("{"): text.rfind("}") + 1]
+        payload = None
+        for loader in (json.loads, ast.literal_eval):
+            try:
+                payload = loader(body)
+                break
+            except (ValueError, SyntaxError):
+                continue
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict) and isinstance(error.get("message"), str):
+                text = error["message"]
+            elif isinstance(error, str):
+                text = error
+            elif isinstance(payload.get("message"), str):
+                text = payload["message"]
+        text = " ".join(text.split())
+
+    if len(text) > 240:
+        text = text[:237].rstrip() + "…"
+    return text
 
 # ── Text-based tool call parser ───────────────────────────────────────────────
 
@@ -173,6 +236,33 @@ class CleanerAgent:
         self.cleanup_plan: Optional[dict] = None
         self._sig = _origin_sig()
 
+    def _not_found_help(self, raw: str) -> str:
+        """Explain a rejected model id in terms the user can act on.
+
+        A gateway answers ``404 model_not_found`` with a wall of JSON, which
+        reads like a crash. What actually happened is that the id we sent is
+        not in the endpoint's catalogue — usually a stray vendor prefix or a
+        ":free"-style suffix — so say that, and say where to fix it.
+        """
+        model_id = _strip_provider_prefix(self.model)
+        if self.settings.endpoint_for(self.settings.get_active_provider()):
+            advice = (
+                "Model ids must match the endpoint exactly — an extra vendor prefix\n"
+                "or a \":free\"-style suffix is enough for the gateway to reject it.\n"
+                "Open Settings (⚙) → Custom endpoints, press Fetch models, and pick\n"
+                "an id from the list."
+            )
+        else:
+            advice = (
+                "Pick the model again in Settings (⚙) — the provider does not offer\n"
+                "the id that is currently selected."
+            )
+        lines = [f'The endpoint does not host "{model_id}" — {self.model_display}.', advice]
+        quoted = _endpoint_quote(raw)
+        if quoted:
+            lines += ["", f"Endpoint said: {quoted}"]
+        return "\n".join(lines)
+
     def run(self, user_message: str) -> Generator[dict, None, None]:
         """
         Drive the agent loop. Yields event dicts for the TUI to consume.
@@ -211,20 +301,40 @@ class CleanerAgent:
                 except litellm.RateLimitError as exc:
                     yield {"type": "error", "text": f"Rate limit: {exc}. Wait a moment and retry."}
                     return
-                except litellm.AuthenticationError:
-                    yield {
-                        "type": "error",
-                        "text": (
-                            "Authentication failed. Check your API key in .env\n"
+                except litellm.NotFoundError as exc:
+                    yield {"type": "error", "text": self._not_found_help(str(exc))}
+                    return
+                except litellm.AuthenticationError as exc:
+                    endpoint = self.settings.endpoint_for(self.settings.get_active_provider())
+                    if endpoint is not None:
+                        text = (
+                            f"The endpoint rejected the API key for "
+                            f"\"{endpoint.get('name') or 'Custom endpoint'}\".\n"
+                            "Check the key in Settings (⚙) → Custom endpoints. "
+                            "Leave it blank for a local server that needs none."
+                        )
+                    else:
+                        text = (
+                            "Authentication failed. Check the API key in "
+                            "Settings (⚙)\n"
                             "Anthropic: https://console.anthropic.com\n"
                             "OpenRouter: https://openrouter.ai\n"
-                            "Custom endpoint: OPENAI_COMPAT_API_KEY / "
-                            "OPENAI_COMPAT_BASE_URL"
-                        ),
-                    }
+                            "OpenAI: https://platform.openai.com"
+                        )
+                    quoted = _endpoint_quote(exc)
+                    yield {"type": "error", "text": f"{text}\n\n{quoted}" if quoted else text}
                     return
                 except litellm.BadRequestError as exc:
-                    yield {"type": "error", "text": f"Bad request: {exc}"}
+                    text = str(exc)
+                    lowered = text.lower()
+                    if "model" in lowered and (
+                        "not found" in lowered
+                        or "does not exist" in lowered
+                        or "model_not_found" in lowered
+                    ):
+                        yield {"type": "error", "text": self._not_found_help(text)}
+                        return
+                    yield {"type": "error", "text": f"Bad request: {text}"}
                     return
                 except litellm.APIConnectionError as exc:
                     # Ollama cloud returns "Server overloaded" transiently

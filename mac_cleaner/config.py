@@ -12,12 +12,14 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from mac_cleaner import store
 
 # ── Centralized model registry ────────────────────────────────────────────────
 # Tuple format: (model id, display label).
@@ -200,6 +202,25 @@ PROVIDER_SPECS: dict[str, dict[str, str]] = {
     },
 }
 
+# Custom OpenAI-compatible endpoints are not rows in PROVIDER_SPECS — the user
+# can add any number of them, each with its own URL, key and model list — so
+# every saved endpoint becomes a provider id of the form "custom:<endpoint id>".
+# "openai_compat" survives as the alias for "whichever custom endpoint is
+# active", which is what older .env files set.
+CUSTOM_PREFIX = "custom:"
+CUSTOM_ALIAS = "openai_compat"
+
+
+def is_custom_provider(provider_id: str) -> bool:
+    """Whether a provider id names a saved custom endpoint."""
+    return provider_id.startswith(CUSTOM_PREFIX) and len(provider_id) > len(CUSTOM_PREFIX)
+
+
+def custom_endpoint_id(provider_id: str) -> str:
+    """The endpoint id inside a ``custom:<id>`` provider id."""
+    return provider_id[len(CUSTOM_PREFIX):]
+
+
 # Selection order in settings and the wizard. "auto" is the fallback mode and
 # is not a provider row, so it lives outside the table.
 PROVIDER_ORDER = [
@@ -213,6 +234,15 @@ PROVIDER_ORDER = [
     "ollama_local",
 ]
 
+def provider_label(provider_id: str) -> str:
+    """Display name for any provider id, custom endpoints included."""
+    if is_custom_provider(provider_id):
+        endpoint = store.find_endpoint(custom_endpoint_id(provider_id))
+        return endpoint["name"] if endpoint else "Custom endpoint"
+    spec = PROVIDER_SPECS.get(provider_id)
+    return spec["label"] if spec else provider_id
+
+
 # Providers that predate per-provider model keys. Existing .env files still
 # set PREFERRED_CLOUD_MODEL / PREFERRED_LOCAL_MODEL, so those seed the
 # per-provider value when the specific key is absent.
@@ -225,45 +255,93 @@ _SHARED_MODEL_ATTRS = {
 }
 
 
-def discover_openai_compat_models(
+def _model_ids(payload: Any) -> list[str]:
+    """Model ids from any of the shapes gateways use for a models listing."""
+    items: Any = payload
+    if isinstance(payload, dict):
+        items = []
+        for key in ("data", "models", "items", "result"):
+            if isinstance(payload.get(key), list):
+                items = payload[key]
+                break
+    if not isinstance(items, list):
+        return []
+    found: set[str] = set()
+    for item in items:
+        candidate = ""
+        if isinstance(item, str):
+            candidate = item
+        elif isinstance(item, dict):
+            for key in ("id", "model", "name", "slug"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    candidate = value
+                    break
+        if candidate.strip():
+            found.add(candidate.strip())
+    return sorted(found, key=str.casefold)
+
+
+def discover_models(
     base_url: str, api_key: str = "", timeout: float = 8.0
-) -> list[str]:
-    """Return model IDs from an OpenAI-compatible models endpoint, if available."""
-    base = base_url.strip().rstrip("/")
+) -> tuple[list[str], str]:
+    """Ask an endpoint which models it hosts.
+
+    Returns ``(model_ids, error)``. On success the error is empty — including
+    when the endpoint answers with an empty list, which is a real (if useless)
+    answer. The GUI needs the reason to tell the user *why* it showed nothing,
+    which is how a mistyped base URL stops looking like a broken app.
+    """
+    base = (base_url or "").strip().rstrip("/")
     if not base:
-        return []
-    request = Request(
-        f"{base}/models",
-        headers={
-            "Authorization": f"Bearer {api_key.strip() or 'not-needed'}",
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
-        return []
-    data = payload.get("data", []) if isinstance(payload, dict) else []
-    return sorted(
-        {
-            item["id"].strip()
-            for item in data
-            if isinstance(item, dict)
-            and isinstance(item.get("id"), str)
-            and item["id"].strip()
-        },
-        key=str.casefold,
-    )
+        return [], "Add a Base URL first."
+    # Most gateways serve /v1/models; some serve /models. Try both before
+    # giving up, so either form of base URL works as typed.
+    urls = [f"{base}/models"]
+    if not base.endswith("/v1"):
+        urls.append(f"{base}/v1/models")
+
+    last_error = ""
+    for url in urls:
+        request = Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {(api_key or '').strip() or 'not-needed'}",
+                "Accept": "application/json",
+            },
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8", "replace"))
+        except HTTPError as exc:
+            last_error = f"HTTP {exc.code} from {url}"
+        except URLError as exc:
+            last_error = f"Cannot reach {url} — {exc.reason}"
+        except TimeoutError:
+            last_error = f"{url} did not answer within {timeout:.0f}s"
+        except (OSError, ValueError) as exc:
+            last_error = f"Unreadable response from {url} — {exc}"
+        else:
+            models = _model_ids(payload)
+            if models:
+                return models, ""
+            last_error = f"{url} returned no model ids"
+    return [], last_error
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(store.env_file()),
         env_file_encoding="utf-8",
         extra="ignore",
         populate_by_name=True,
     )
+
+    def __init__(self, **values: Any) -> None:
+        # Resolve the .env at construction time, not at import time: the
+        # bundled app's working directory is "/", where a relative path fails.
+        values.setdefault("_env_file", str(store.env_file()))
+        super().__init__(**values)
 
     active_provider: str = Field(default="auto", alias="ACTIVE_PROVIDER")
 
@@ -291,10 +369,47 @@ class Settings(BaseSettings):
     preferred_local_model: str = Field(default="qwen2.5:14b", alias="PREFERRED_LOCAL_MODEL")
     safe_mode: bool = Field(default=False, alias="SAFE_MODE")
 
+    # ── Custom endpoint accessors ─────────────────────────────────────────────
+
+    def endpoints(self, *, refresh: bool = False) -> list[dict]:
+        """Every saved custom endpoint, in the order the user added them."""
+        return store.list_endpoints(refresh=refresh)
+
+    def endpoint_for(self, provider: str) -> Optional[dict]:
+        """The saved custom endpoint a provider id refers to, if any."""
+        if is_custom_provider(provider):
+            return store.find_endpoint(custom_endpoint_id(provider))
+        if provider == CUSTOM_ALIAS:
+            return store.active_endpoint()
+        return None
+
+    def select_endpoint(self, endpoint_id: str) -> None:
+        """Make a saved custom endpoint the one new requests use."""
+        store.set_active_endpoint(endpoint_id)
+        self.active_provider = f"{CUSTOM_PREFIX}{endpoint_id}"
+
+    @staticmethod
+    def endpoint_status(endpoint: Optional[dict]) -> tuple[bool, str]:
+        """Whether the given endpoint record is usable, and why not.
+
+        Shared by the settings page (for the record being edited) and by
+        :meth:`provider_status`, so the two can never disagree.
+        """
+        if not endpoint:
+            return False, "Add a custom endpoint"
+        if not str(endpoint.get("base_url", "")).strip():
+            return False, "Add a Base URL"
+        if not str(endpoint.get("model", "")).strip():
+            return False, "Choose a model"
+        return True, f"Ready · {store.host_label(endpoint['base_url'])}"
+
     # ── Per-provider accessors ────────────────────────────────────────────────
 
     def model_for(self, provider: str) -> str:
         """Selected model id for a provider, falling back to the legacy keys."""
+        endpoint = self.endpoint_for(provider)
+        if endpoint is not None:
+            return str(endpoint.get("model", "")).strip()
         spec = PROVIDER_SPECS.get(provider)
         if spec is None:
             return ""
@@ -307,15 +422,26 @@ class Settings(BaseSettings):
         return ""
 
     def set_model_for(self, provider: str, model: str) -> None:
+        endpoint = self.endpoint_for(provider)
+        if endpoint is not None:
+            store.upsert_endpoint({**endpoint, "model": model}, make_active=False)
+            return
         spec = PROVIDER_SPECS.get(provider)
         if spec:
             setattr(self, spec["model_attr"], model)
 
     def api_key_for(self, provider: str) -> str:
+        endpoint = self.endpoint_for(provider)
+        if endpoint is not None:
+            return str(endpoint.get("api_key", ""))
         spec = PROVIDER_SPECS.get(provider)
         return getattr(self, spec["key_attr"], "") if spec and spec["key_attr"] else ""
 
     def set_api_key(self, provider: str, key: str) -> None:
+        endpoint = self.endpoint_for(provider)
+        if endpoint is not None:
+            store.upsert_endpoint({**endpoint, "api_key": key}, make_active=False)
+            return
         spec = PROVIDER_SPECS.get(provider)
         if spec and spec["key_attr"]:
             setattr(self, spec["key_attr"], key)
@@ -327,16 +453,14 @@ class Settings(BaseSettings):
         the chat prints before a request, so the wording cannot drift apart.
         """
         spec = PROVIDER_SPECS.get(provider)
-        if spec is None:
+        if spec is None and not is_custom_provider(provider):
             return False, f"Unknown provider: {provider}"
+        if spec is not None and spec["auth"] == "endpoint":
+            return self.endpoint_status(self.endpoint_for(provider))
+        if spec is None:  # a custom:<id> provider id
+            return self.endpoint_status(self.endpoint_for(provider))
         if spec["auth"] == "signin":
             return True, f"Signs in with the {spec['cli']} CLI on first use"
-        if spec["auth"] == "endpoint":
-            if not self.openai_compat_base_url.strip():
-                return False, "Add a Base URL"
-            if not self.model_for(provider):
-                return False, "Add a model ID"
-            return True, f"Ready · {self._compat_host()}"
         if spec["key_env"] and not self.api_key_for(provider):
             return False, f"Add {spec['key_env']}"
         if provider == "ollama_local":
@@ -350,29 +474,35 @@ class Settings(BaseSettings):
 
     # ── Active provider resolution ────────────────────────────────────────────
 
-    def _use_openai_compat(self) -> bool:
-        configured = bool(self.openai_compat_base_url.strip() and self.openai_compat_model.strip())
-        if self.active_provider == "openai_compat":
-            return configured
+    def _custom_endpoint_ready(self) -> bool:
+        endpoint = store.active_endpoint()
         return bool(
-            self.active_provider == "auto"
-            and configured
-            and not self.anthropic_api_key
-            and not self.openrouter_api_key
-            and not self.openai_api_key
+            endpoint
+            and str(endpoint.get("base_url", "")).strip()
+            and str(endpoint.get("model", "")).strip()
         )
 
     def get_active_provider(self) -> str:
         if self.active_provider != "auto":
+            # A pinned custom endpoint can be removed from another window; fall
+            # back to automatic resolution rather than failing every request.
+            if is_custom_provider(self.active_provider) and (
+                self.endpoint_for(self.active_provider) is None
+            ):
+                return self._auto_provider()
             return self.active_provider
+        return self._auto_provider()
+
+    def _auto_provider(self) -> str:
+        """First fully configured provider, in the order the UI documents."""
         if self.anthropic_api_key:
             return "anthropic"
         if self.openrouter_api_key:
             return "openrouter"
         if self.openai_api_key:
             return "openai"
-        if self._use_openai_compat():
-            return "openai_compat"
+        if self._custom_endpoint_ready():
+            return CUSTOM_ALIAS
         local = self.preferred_local_model
         return "ollama_cloud" if local.endswith("-cloud") or ":cloud" in local else "ollama_local"
 
@@ -380,23 +510,32 @@ class Settings(BaseSettings):
         self.set_model_for(self.get_active_provider(), model)
 
     def completion_kwargs(self) -> dict:
-        if not self._use_openai_compat():
+        """api_base/api_key for a custom endpoint; empty for every other provider."""
+        endpoint = self.endpoint_for(self.get_active_provider())
+        if endpoint is None:
             return {}
         return {
-            "api_base": self.openai_compat_base_url.strip().rstrip("/"),
-            "api_key": self.openai_compat_api_key.strip() or "not-needed",
+            "api_base": str(endpoint.get("base_url", "")).strip().rstrip("/"),
+            "api_key": str(endpoint.get("api_key", "")).strip() or "not-needed",
         }
 
     def get_active_model(self) -> tuple[str, str]:
         provider = self.get_active_provider()
-        if provider == "openai_compat":
-            if not (self.openai_compat_base_url.strip() and self.openai_compat_model.strip()):
+        endpoint = self.endpoint_for(provider)
+        if endpoint is not None:
+            base_url = str(endpoint.get("base_url", "")).strip()
+            model = str(endpoint.get("model", "")).strip()
+            if not (base_url and model):
+                name = endpoint.get("name") or "Custom endpoint"
                 raise RuntimeError(
-                    "Custom provider is selected, but OPENAI_COMPAT_BASE_URL and "
-                    "OPENAI_COMPAT_MODEL must both be set."
+                    f"\"{name}\" needs a Base URL and a model. "
+                    "Open Settings (⚙) → Custom endpoints to finish it."
                 )
-            model = self.openai_compat_model.strip()
-            return f"openai/{model}", f"{model} (Custom · {self._compat_host()})"
+            # The model id reaches the endpoint verbatim. LiteLLM only uses the
+            # "openai/" prefix to pick the OpenAI-compatible transport, so
+            # gateway ids keep their slashes and suffixes exactly as typed
+            # ("nex-agi/nex-n2.5-pro:free" → "nex-agi/nex-n2.5-pro:free").
+            return f"openai/{model}", f"{model} ({endpoint.get('name') or store.host_label(base_url)})"
         if provider in ("anthropic", "openrouter", "openai"):
             spec = PROVIDER_SPECS[provider]
             key = self.api_key_for(provider)
@@ -433,14 +572,6 @@ class Settings(BaseSettings):
                 raise RuntimeError("Cannot reach a local Ollama model. Start Ollama and pull a model.")
             return f"ollama/{model}", f"{model} (Ollama Local)"
         raise RuntimeError(f"Unknown active provider: {provider}")
-
-    def _compat_host(self) -> str:
-        from urllib.parse import urlparse
-        raw = self.openai_compat_base_url.strip()
-        try:
-            return urlparse(raw if "://" in raw else f"//{raw}").netloc or raw
-        except ValueError:
-            return raw
 
     def _detect_ollama_model(self) -> Optional[str]:
         """Best local Ollama model: the saved one, else a known one, else any."""

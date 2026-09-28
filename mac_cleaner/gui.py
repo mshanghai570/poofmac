@@ -31,12 +31,13 @@ Window layout
 
 from __future__ import annotations
 
+import html
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import (
@@ -51,6 +52,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QFormLayout,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -72,13 +74,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from mac_cleaner import store
 from mac_cleaner.audit import AuditLogger
 from mac_cleaner.config import (
+    CUSTOM_ALIAS,
+    CUSTOM_PREFIX,
     MODEL_REGISTRY,
     PROVIDER_ORDER,
     PROVIDER_SPECS,
     Settings,
-    discover_openai_compat_models,
+    custom_endpoint_id,
+    discover_models,
+    is_custom_provider,
+    provider_label,
 )
 from mac_cleaner.executor import Executor
 from mac_cleaner.llm import CleanerAgent
@@ -654,9 +662,11 @@ class AgentWorker(QThread):
 
 
 class OpenAICompatModelsWorker(QThread):
-    """Fetch model IDs without blocking the GUI thread."""
+    """Ask an endpoint which models it hosts, without blocking the GUI."""
 
-    models_ready = Signal(list)
+    # (model ids, error) — the error is empty on success, and carries the
+    # reason (HTTP 404, unreachable host, no ids) when there is nothing to show.
+    models_ready = Signal(list, str)
 
     def __init__(self, base_url: str, api_key: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -664,9 +674,8 @@ class OpenAICompatModelsWorker(QThread):
         self.api_key = api_key
 
     def run(self) -> None:
-        self.models_ready.emit(
-            discover_openai_compat_models(self.base_url, self.api_key)
-        )
+        models, error = discover_models(self.base_url, self.api_key)
+        self.models_ready.emit(models, error)
 
 
 class ExecutionWorker(QThread):
@@ -920,6 +929,8 @@ class SettingsDialog(QDialog):
     """
 
     # "auto" first, then every real provider — the row order of the left list.
+    # Custom endpoints are not rows: the "openai_compat" row is their manager,
+    # because the user can have any number of them.
     ROWS = ["auto", *PROVIDER_ORDER]
 
     def __init__(self, settings: Settings, t: Theme, parent: Optional[QWidget] = None) -> None:
@@ -933,9 +944,16 @@ class SettingsDialog(QDialog):
         self._initial_models: dict[str, str] = {}
         self._key_edits: dict[str, QLineEdit] = {}
         self._signin: dict[str, dict] = {}
-        self._compat_base_edit: Optional[QLineEdit] = None
         self._models_worker: Optional[OpenAICompatModelsWorker] = None
         self._signin_worker: Optional[SignInWorker] = None
+        # Custom endpoint page state
+        self._endpoint_combo: Optional[QComboBox] = None
+        self._endpoint_name_edit: Optional[QLineEdit] = None
+        self._endpoint_base_edit: Optional[QLineEdit] = None
+        self._endpoint_status: Optional[QLabel] = None
+        self._endpoint_remove_btn: Optional[QPushButton] = None
+        self._current_endpoint_id = ""
+        self._endpoint_note = ""
 
         self.setWindowTitle("PoofMac Settings")
         self.setWindowModality(Qt.WindowModality.ApplicationModal)
@@ -985,7 +1003,11 @@ class SettingsDialog(QDialog):
         self._provider_list.setFixedWidth(210)
         self._provider_list.addItem("Automatic")
         for provider_id in PROVIDER_ORDER:
-            self._provider_list.addItem(PROVIDER_SPECS[provider_id]["label"])
+            self._provider_list.addItem(
+                "Custom endpoints"
+                if provider_id == CUSTOM_ALIAS
+                else PROVIDER_SPECS[provider_id]["label"]
+            )
         side.addWidget(self._provider_list)
 
         self._provider_status = QLabel()
@@ -1003,8 +1025,11 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._detail_stack, stretch=1)
 
         # Open on whatever the user actually has selected, so the page they
-        # need is already showing.
+        # need is already showing. A custom:<id> selection belongs to the
+        # custom endpoints page.
         active = self.settings.active_provider
+        if is_custom_provider(active):
+            active = CUSTOM_ALIAS
         row = self.ROWS.index(active) if active in self.ROWS else 0
         self._provider_list.currentRowChanged.connect(self._on_provider_row_changed)
         self._provider_list.setCurrentRow(row)
@@ -1035,13 +1060,8 @@ class SettingsDialog(QDialog):
         spec = PROVIDER_SPECS[provider_id]
 
         if spec["auth"] == "endpoint":
-            layout.addWidget(QLabel("Base URL"))
-            self._compat_base_edit = QLineEdit(self.settings.openai_compat_base_url)
-            self._compat_base_edit.setPlaceholderText(
-                "http://localhost:11434/v1  ·  http://localhost:1234/v1  ·  "
-                "https://api.groq.com/openai/v1"
-            )
-            layout.addWidget(self._compat_base_edit)
+            # The whole page is an endpoint manager — see _build_endpoint_page.
+            return self._build_endpoint_page(provider_id, spec)
 
         if spec["key_env"]:
             layout.addWidget(QLabel(f"{spec['label']} API key"))
@@ -1065,15 +1085,107 @@ class SettingsDialog(QDialog):
         self._model_combos[provider_id] = combo
         self._initial_models[provider_id] = current
         model_row.addWidget(combo, stretch=1)
-        if spec["auth"] == "endpoint":
-            refresh_btn = _btn("Fetch models", "secondary")
-            refresh_btn.clicked.connect(self._fetch_compat_models)
-            model_row.addWidget(refresh_btn)
         layout.addLayout(model_row)
 
         if spec["auth"] == "signin":
             layout.addWidget(self._build_signin_block(provider_id, spec))
 
+        layout.addStretch()
+        return page
+
+    def _build_endpoint_page(self, provider_id: str, spec: dict) -> QWidget:
+        """Manager for the user's custom OpenAI-compatible endpoints.
+
+        One row here is one saved endpoint — its own name, base URL, key and the
+        models it hosts. Switching rows swaps every field, so a local server and
+        a work gateway can coexist without re-typing anything.
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "Any service that speaks the OpenAI chat-completions API: LM Studio, "
+            "vLLM, llama.cpp, Ollama's /v1, Groq, a company gateway. Add as many as "
+            "you like — each keeps its own URL, key and model list."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet(
+            f"font-size: 12px; color: {self.t.text_secondary}; background: transparent;"
+        )
+        layout.addWidget(intro)
+
+        pick_row = QHBoxLayout()
+        self._endpoint_combo = QComboBox()
+        self._endpoint_combo.setToolTip("Saved endpoints — pick one to edit")
+        self._endpoint_combo.currentIndexChanged.connect(self._on_endpoint_selected)
+        pick_row.addWidget(self._endpoint_combo, stretch=1)
+
+        new_btn = _btn("＋ New", "secondary")
+        new_btn.setToolTip("Start a new endpoint")
+        new_btn.clicked.connect(self._new_endpoint)
+        pick_row.addWidget(new_btn)
+
+        self._endpoint_remove_btn = _btn("Remove", "secondary")
+        self._endpoint_remove_btn.clicked.connect(self._remove_endpoint)
+        pick_row.addWidget(self._endpoint_remove_btn)
+        layout.addLayout(pick_row)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+
+        self._endpoint_name_edit = QLineEdit()
+        self._endpoint_name_edit.setPlaceholderText("Nex AGI · LM Studio · work gateway")
+        form.addRow("Name", self._endpoint_name_edit)
+
+        self._endpoint_base_edit = QLineEdit()
+        self._endpoint_base_edit.setPlaceholderText(
+            "http://localhost:11434/v1  ·  http://localhost:1234/v1  ·  "
+            "https://api.groq.com/openai/v1"
+        )
+        form.addRow("Base URL", self._endpoint_base_edit)
+
+        key_edit = QLineEdit()
+        key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        key_edit.setPlaceholderText(spec["key_placeholder"])
+        self._key_edits[provider_id] = key_edit
+        form.addRow("API key", key_edit)
+
+        model_row = QHBoxLayout()
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setPlaceholderText("model id, exactly as the endpoint lists it")
+        self._model_combos[provider_id] = combo
+        self._initial_models[provider_id] = ""
+        model_row.addWidget(combo, stretch=1)
+
+        fetch_btn = _btn("Fetch models", "secondary")
+        fetch_btn.setToolTip("Ask this endpoint which models it hosts")
+        fetch_btn.clicked.connect(self._fetch_compat_models)
+        model_row.addWidget(fetch_btn)
+
+        save_btn = _btn("Save endpoint", "primary")
+        save_btn.setToolTip("Keep these details for reuse")
+        save_btn.clicked.connect(self._save_endpoint_clicked)
+        model_row.addWidget(save_btn)
+        form.addRow("Model", model_row)
+        layout.addLayout(form)
+
+        self._endpoint_status = QLabel()
+        self._endpoint_status.setWordWrap(True)
+        layout.addWidget(self._endpoint_status)
+
+        # Live feedback: the status line reacts as fields are typed, so the page
+        # is never silently wrong about what will be used.
+        for widget in (self._endpoint_name_edit, self._endpoint_base_edit, key_edit):
+            widget.textChanged.connect(self._refresh_endpoint_status)
+        combo.currentTextChanged.connect(self._refresh_endpoint_status)
+
+        self._reload_endpoints()
         layout.addStretch()
         return page
 
@@ -1118,9 +1230,23 @@ class SettingsDialog(QDialog):
     def _refresh_provider_status(self) -> None:
         """One line telling the user whether the highlighted provider is usable."""
         selected = self._selected_provider
+        # On the custom page, report the endpoint being edited rather than the
+        # last saved one, so the sidebar cannot contradict the page.
+        if selected == CUSTOM_ALIAS and self._endpoint_status is not None:
+            ok, message = Settings.endpoint_status(self._endpoint_from_widgets())
+            self._provider_status.setText(
+                f"Custom endpoints — {'✓' if ok else '⚠'} {message}"
+            )
+            return
         provider_id = (
             self.settings.get_active_provider() if selected == "auto" else selected
         )
+        if is_custom_provider(provider_id):
+            ok, message = self.settings.provider_status(provider_id)
+            self._provider_status.setText(
+                f"{provider_label(provider_id)} — {'✓' if ok else '⚠'} {message}"
+            )
+            return
         if provider_id not in PROVIDER_SPECS:
             self._provider_status.setText("No provider is configured yet.")
             return
@@ -1129,31 +1255,237 @@ class SettingsDialog(QDialog):
         where = f"Automatic resolves to {label}" if selected == "auto" else label
         self._provider_status.setText(f"{where} — {'✓' if ok else '⚠'} {message}")
 
-    # ── Custom endpoint model discovery ───────────────────────────────────────
+    # ── Custom endpoints: save, fetch and remove ──────────────────────────────
+
+    def _reload_endpoints(self, select: str = "") -> None:
+        """Rebuild the endpoint picker from disk, keeping a sensible selection."""
+        if self._endpoint_combo is None:
+            return
+        endpoints = store.list_endpoints(refresh=True)
+        wanted = select
+        if is_custom_provider(wanted):
+            wanted = custom_endpoint_id(wanted)
+        elif wanted == CUSTOM_ALIAS:
+            wanted = ""
+        if not wanted:
+            wanted = self._current_endpoint_id or store.active_endpoint_id()
+        ids = [endpoint["id"] for endpoint in endpoints]
+        if wanted not in ids:
+            wanted = ids[0] if ids else ""
+
+        combo = self._endpoint_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for endpoint in endpoints:
+            combo.addItem(
+                f"{endpoint['name']}  —  {store.host_label(endpoint['base_url'])}",
+                endpoint["id"],
+            )
+        combo.addItem("＋ New endpoint…", "")
+        index = combo.findData(wanted)
+        combo.setCurrentIndex(index if index >= 0 else combo.count() - 1)
+        combo.blockSignals(False)
+        self._load_endpoint_into_widgets(wanted)
+
+    def _load_endpoint_into_widgets(self, endpoint_id: str) -> None:
+        endpoint = store.find_endpoint(endpoint_id) if endpoint_id else None
+        self._current_endpoint_id = endpoint["id"] if endpoint else ""
+        self._endpoint_note = ""
+        self._endpoint_name_edit.setText(endpoint["name"] if endpoint else "")
+        self._endpoint_base_edit.setText(endpoint["base_url"] if endpoint else "")
+        self._key_edits["openai_compat"].setText(endpoint["api_key"] if endpoint else "")
+        combo = self._model_combos["openai_compat"]
+        combo.blockSignals(True)
+        combo.clear()
+        for model_id in (endpoint["models"] if endpoint else []):
+            combo.addItem(model_id, model_id)
+        combo.setCurrentText(endpoint["model"] if endpoint else "")
+        combo.blockSignals(False)
+        if self._endpoint_remove_btn is not None:
+            self._endpoint_remove_btn.setEnabled(endpoint is not None)
+        self._refresh_endpoint_status()
+
+    def _endpoint_from_widgets(self) -> dict:
+        """The endpoint the form currently describes, saved or not."""
+        combo = self._model_combos["openai_compat"]
+        draft = store.new_endpoint(
+            name=self._endpoint_name_edit.text(),
+            base_url=self._endpoint_base_edit.text(),
+            api_key=self._key_edits["openai_compat"].text(),
+            model=combo.currentText(),
+            models=[combo.itemText(i) for i in range(combo.count())],
+        )
+        draft["id"] = self._current_endpoint_id
+        return draft
+
+    def _refresh_endpoint_status(self, *_args: Any) -> None:
+        if self._endpoint_status is None:
+            return
+        draft = self._endpoint_from_widgets()
+        ok, message = Settings.endpoint_status(draft)
+        count = len(draft["models"])
+        summary = (
+            f"{count} model{'s' if count != 1 else ''} known for this endpoint"
+            if count
+            else "no models listed yet — press Fetch models"
+        )
+        text = f"{'✓' if ok else '⚠'} {message} · {summary}"
+        if self._endpoint_note:
+            text = f"{text}\n{self._endpoint_note}"
+        self._endpoint_status.setText(text)
+        self._endpoint_status.setStyleSheet(
+            "font-size: 11px; background: transparent;"
+            f"color: {self.t.green if ok else self.t.orange};"
+        )
+
+    def _commit_endpoint(self, quiet: bool = False) -> Optional[dict]:
+        """Persist the endpoint the form describes, if it is usable."""
+        draft = self._endpoint_from_widgets()
+        if not draft["base_url"] or not draft["model"]:
+            if not quiet:
+                missing = "Base URL" if not draft["base_url"] else "model id"
+                QMessageBox.warning(
+                    self,
+                    "Nothing saved yet",
+                    f"Add the endpoint's {missing} first.\n\n"
+                    "Base URL example:  http://localhost:11434/v1\n"
+                    "Press Fetch models to list the ids this endpoint hosts.",
+                )
+            return None
+        try:
+            saved = store.upsert_endpoint(draft, make_active=True)
+        except OSError as exc:
+            if not quiet:
+                QMessageBox.warning(
+                    self,
+                    "Could not save endpoint",
+                    f"{exc}\n\nPoofMac tried to write:\n{store.endpoints_file()}",
+                )
+            return None
+        if saved is not None:
+            self._current_endpoint_id = saved["id"]
+        return saved
+
+    def _on_endpoint_selected(self, index: int) -> None:
+        if self._endpoint_combo is None:
+            return
+        target = self._endpoint_combo.itemData(index) or ""
+        if not target:
+            self._new_endpoint()
+            return
+        # Persist the row being left, so switching endpoints never loses edits.
+        self._commit_endpoint(quiet=True)
+        self._reload_endpoints(select=target)
+
+    def _new_endpoint(self, *_args: Any) -> None:
+        """Clear the form for a new endpoint, keeping any complete draft."""
+        self._commit_endpoint(quiet=True)
+        self._current_endpoint_id = ""
+        self._endpoint_note = ""
+        self._endpoint_name_edit.clear()
+        self._endpoint_base_edit.clear()
+        self._key_edits["openai_compat"].clear()
+        combo = self._model_combos["openai_compat"]
+        combo.blockSignals(True)
+        combo.clear()
+        combo.setCurrentText("")
+        combo.blockSignals(False)
+        if self._endpoint_combo is not None:
+            self._endpoint_combo.blockSignals(True)
+            self._endpoint_combo.setCurrentIndex(self._endpoint_combo.count() - 1)
+            self._endpoint_combo.blockSignals(False)
+        if self._endpoint_remove_btn is not None:
+            self._endpoint_remove_btn.setEnabled(False)
+        self._endpoint_base_edit.setFocus()
+        self._refresh_endpoint_status()
+
+    def _save_endpoint_clicked(self) -> None:
+        saved = self._commit_endpoint(quiet=False)
+        if saved is None:
+            return
+        self._reload_endpoints(select=saved["id"])
+        self._endpoint_note = (
+            f"✓ Saved “{saved['name']}”. Press Save & Close to use it right away."
+        )
+        self._refresh_endpoint_status()
+        self._refresh_provider_status()
+
+    def _remove_endpoint(self) -> None:
+        endpoint_id = self._current_endpoint_id
+        if not endpoint_id:
+            return
+        endpoint = store.find_endpoint(endpoint_id) or {}
+        name = endpoint.get("name") or store.host_label(endpoint.get("base_url", ""))
+        answer = QMessageBox.question(
+            self,
+            "Remove endpoint",
+            f"Remove “{name}”?\n\nIts URL, key and model list are deleted from this Mac.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            remaining = store.remove_endpoint(endpoint_id)
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not remove endpoint", str(exc))
+            return
+        if is_custom_provider(self.settings.active_provider) or (
+            self.settings.active_provider == CUSTOM_ALIAS
+        ):
+            self.settings.active_provider = CUSTOM_ALIAS if remaining else "auto"
+        self._current_endpoint_id = ""
+        self._reload_endpoints(select=remaining[0]["id"] if remaining else "")
+        self._refresh_provider_status()
 
     def _fetch_compat_models(self) -> None:
-        base_url = (self._compat_base_edit.text() if self._compat_base_edit else "").strip()
+        base_url = self._endpoint_base_edit.text().strip()
         if not base_url:
+            self._endpoint_status.setText("⚠ Add a Base URL first, then press Fetch models.")
             return
-        if self._models_worker and self._models_worker.isRunning():
+        if self._models_worker is not None and self._models_worker.isRunning():
             return
-        api_key = self._key_edits["openai_compat"].text()
-        worker = OpenAICompatModelsWorker(base_url, api_key, self)
+        self._endpoint_status.setText(f"Contacting {store.host_label(base_url)}…")
+        worker = OpenAICompatModelsWorker(
+            base_url, self._key_edits["openai_compat"].text(), self
+        )
         self._models_worker = worker
         worker.models_ready.connect(self._set_compat_models)
         worker.start()
 
-    def _set_compat_models(self, models: list[str]) -> None:
+    def _set_compat_models(self, models: list, error: str) -> None:
+        """Fold a models listing (or the reason there is none) into the page."""
+        if self._endpoint_status is None:
+            return
         combo = self._model_combos["openai_compat"]
         current = combo.currentText().strip()
+        host = store.host_label(self._endpoint_base_edit.text())
+        if not models:
+            self._endpoint_note = (
+                f"⚠ {error or 'The endpoint returned no models'}.\n"
+                "Type the model id exactly as the endpoint lists it, then press "
+                "Save endpoint."
+            )
+            self._refresh_endpoint_status()
+            return
         combo.blockSignals(True)
         combo.clear()
         for model_id in models:
             combo.addItem(model_id, model_id)
         if current and current not in models:
+            # A hand-typed id stays selectable — /models is often incomplete.
             combo.addItem(current, current)
-        combo.setCurrentText(current)
+            combo.setCurrentText(current)
+        else:
+            combo.setCurrentText(current or models[0])
         combo.blockSignals(False)
+
+        plural = "s" if len(models) != 1 else ""
+        self._endpoint_note = f"✓ {len(models)} model{plural} found on {host}"
+        saved = self._commit_endpoint(quiet=True)
+        if saved is not None:
+            self._endpoint_note += f" — saved as “{saved['name']}”."
+        self._refresh_endpoint_status()
         self._refresh_provider_status()
 
     # ── CLI sign-in ────────────────────────────────────────────────────────────
@@ -1227,66 +1559,73 @@ class SettingsDialog(QDialog):
 
         self._apply_widgets_to_settings()
 
-        provider_id = self._selected_provider
+        provider_id = self.settings.active_provider
         if provider_id != "auto":
             ok, message = self.settings.provider_status(provider_id)
             if not ok:
                 QMessageBox.warning(
                     self,
-                    f"{PROVIDER_SPECS[provider_id]['label']} is not ready",
+                    f"{provider_label(provider_id)} is not ready",
                     f"{message}\n\nFix it, or pick a different provider.",
                 )
                 return
 
         try:
-            from dotenv import find_dotenv, set_key
-
-            env_path = find_dotenv(usecwd=True) or ".env"
-            set_key(env_path, "ACTIVE_PROVIDER", provider_id)
+            # One writer, one location: store.env_file() is a per-user path the
+            # bundled app can always write to (its working directory is "/").
+            values: dict[str, Any] = {
+                "ACTIVE_PROVIDER": provider_id,
+                "SAFE_MODE": str(self._safe_mode_check.isChecked()).lower(),
+            }
             for pid, spec in PROVIDER_SPECS.items():
+                if spec["auth"] == "endpoint":
+                    continue  # custom endpoints live in endpoints.json
                 # Write the raw per-provider value, not model_for(): an unset
                 # provider must stay empty rather than inherit the legacy
                 # shared key, or the next save would pin it to someone else's
                 # model.
                 model = getattr(self.settings, spec["model_attr"], "")
                 if spec["model_env"] and model:
-                    set_key(env_path, spec["model_env"], model)
+                    values[spec["model_env"]] = model
                 if spec["key_env"]:
-                    set_key(env_path, spec["key_env"], self.settings.api_key_for(pid))
-            set_key(
-                env_path,
-                "OPENAI_COMPAT_BASE_URL",
-                self.settings.openai_compat_base_url.strip().rstrip("/"),
-            )
-            set_key(
-                env_path,
-                "SAFE_MODE",
-                str(self._safe_mode_check.isChecked()).lower(),
-            )
+                    values[spec["key_env"]] = self.settings.api_key_for(pid)
+            written = store.write_env_values(values)
             self.settings.safe_mode = self._safe_mode_check.isChecked()
 
             new_active = self.settings.get_active_model()
             self.provider_changed = prev_active != new_active
+            self._saved_to = written
         except Exception as exc:  # noqa: BLE001
             # Settings still applied in memory — surface it instead of failing
             # silently, then let the user close the dialog normally.
-            QMessageBox.warning(self, "Could not write .env", str(exc))
+            QMessageBox.warning(
+                self,
+                "Could not save settings",
+                f"{exc}\n\nPoofMac tried to write:\n{store.env_file()}",
+            )
 
         self.accept()
 
     def _apply_widgets_to_settings(self) -> None:
         """Copy every widget into Settings, then validate the chosen provider."""
+        # The custom page edits a record in the endpoint store rather than a
+        # Settings attribute, so it is committed first.
+        self._commit_endpoint(quiet=True)
         for pid, edit in self._key_edits.items():
+            if pid == CUSTOM_ALIAS:
+                continue
             self.settings.set_api_key(pid, edit.text().strip())
         for pid, combo in self._model_combos.items():
+            if pid == CUSTOM_ALIAS:
+                continue
             model = combo.currentText().strip()
             if model and model != self._initial_models.get(pid, ""):
                 self.settings.set_model_for(pid, model)
-        if self._compat_base_edit is not None:
-            self.settings.openai_compat_base_url = (
-                self._compat_base_edit.text().strip().rstrip("/")
-            )
-        self.settings.active_provider = self._selected_provider
+        provider_id = self._selected_provider
+        if provider_id == CUSTOM_ALIAS and self._current_endpoint_id:
+            # Pin the endpoint the user was just working on, not the alias.
+            provider_id = f"{CUSTOM_PREFIX}{self._current_endpoint_id}"
+        self.settings.active_provider = provider_id
 
 
 # ── Table column indices ──────────────────────────────────────────────────────
@@ -1320,7 +1659,6 @@ class PoofMacWindow(QMainWindow):
         # Persistent chat agent — reused across follow-up messages so the AI
         # remembers previous context ("now delete those", "what about logs?")
         self._chat_agent: Optional[CleanerAgent] = None
-        self._compat_models_worker: Optional[OpenAICompatModelsWorker] = None
         self._logged_status = False
 
         self.setWindowTitle("PoofMac")
@@ -1556,76 +1894,63 @@ class PoofMacWindow(QMainWindow):
 
     # ── Model picker ───────────────────────────────────────────────────────────
 
+    def _provider_groups(self) -> list[tuple[str, str]]:
+        """Picker sections: each saved custom endpoint, then the built-ins.
+
+        One group per endpoint, so the picker lists exactly the models that
+        endpoint hosts — saved when the user pressed Fetch models in Settings,
+        which means opening the window never waits on the network.
+        """
+        groups: list[tuple[str, str]] = []
+        for provider_id in PROVIDER_ORDER:
+            if provider_id == CUSTOM_ALIAS:
+                for endpoint in self.settings.endpoints():
+                    name = endpoint["name"] or store.host_label(endpoint["base_url"])
+                    groups.append((name, f"{CUSTOM_PREFIX}{endpoint['id']}"))
+                continue
+            groups.append((PROVIDER_SPECS[provider_id]["label"], provider_id))
+        return groups
+
     def _populate_model_picker(self) -> None:
+        self.settings.endpoints(refresh=True)
         active_provider = self.settings.get_active_provider()
 
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
         model = self.model_combo.model()
-        for provider_id in PROVIDER_ORDER:
-            spec = PROVIDER_SPECS[provider_id]
-            self.model_combo.addItem(f"── {spec['label']} ──")
+        selected_row = -1
+        for label, provider_id in self._provider_groups():
+            self.model_combo.addItem(f"── {label} ──")
             model.item(self.model_combo.count() - 1).setEnabled(False)
             current = self.settings.model_for(provider_id)
             for model_id in self._models_for(provider_id):
                 self.model_combo.addItem(model_id, (provider_id, model_id))
                 if active_provider == provider_id and current == model_id:
-                    self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
+                    selected_row = self.model_combo.count() - 1
+        if selected_row >= 0:
+            self.model_combo.setCurrentIndex(selected_row)
+        elif self.model_combo.count() > 1:
+            # Never leave a disabled group header as the visible selection.
+            self.model_combo.setCurrentIndex(1)
         self.model_combo.blockSignals(False)
-
-        # Discovered custom models arrive after the combo is populated, so a
-        # fast local server cannot select into a half-built list.
-        base_url = self.settings.openai_compat_base_url.strip()
-        if base_url:
-            worker = OpenAICompatModelsWorker(
-                base_url, self.settings.openai_compat_api_key, self
-            )
-            self._compat_models_worker = worker
-            worker.models_ready.connect(
-                lambda models, url=base_url: self._add_custom_models(models, url)
-            )
-            worker.start()
 
     def _models_for(self, provider_id: str) -> list[str]:
         """Model ids to offer for a provider in the toolbar picker."""
+        endpoint = self.settings.endpoint_for(provider_id)
+        if endpoint is not None:
+            known = list(endpoint.get("models") or [])
+            current = str(endpoint.get("model", "")).strip()
+            if current and current not in known:
+                known.insert(0, current)
+            return known
         spec = PROVIDER_SPECS[provider_id]
         known = [model_id for model_id, _ in MODEL_REGISTRY.get(spec["registry"], [])]
         current = self.settings.model_for(provider_id)
         if provider_id == "ollama_local":
             known += [m for m in self._list_local_ollama_models() if m not in known]
-        if provider_id == "openai_compat":
-            # Only the saved id is known until discovery answers; it must still
-            # be selectable, or the current model becomes unresettable.
-            return sorted({current, *known} - {""}, key=str.casefold)
         if current and current not in known:
             known.append(current)
         return known
-
-    def _add_custom_models(self, models: list[str], base_url: str) -> None:
-        """Append models discovered from the custom endpoint, once."""
-        if self._compat_models_worker is None or base_url != self.settings.openai_compat_base_url.strip():
-            return
-        self._compat_models_worker = None
-        discovered = [m for m in models if m]
-        if not discovered:
-            return
-        self.model_combo.blockSignals(True)
-        existing = {
-            self.model_combo.itemData(i)[1]
-            for i in range(self.model_combo.count())
-            if isinstance(self.model_combo.itemData(i), tuple)
-        }
-        for model_id in discovered:
-            if model_id not in existing:
-                self.model_combo.addItem(model_id, ("openai_compat", model_id))
-                existing.add(model_id)
-        if self.settings.get_active_provider() == "openai_compat":
-            saved = self.settings.model_for("openai_compat")
-            if saved in existing:
-                self.model_combo.setCurrentIndex(
-                    self.model_combo.findData(("openai_compat", saved))
-                )
-        self.model_combo.blockSignals(False)
 
     @staticmethod
     def _list_local_ollama_models() -> list[str]:
@@ -1647,21 +1972,24 @@ class PoofMacWindow(QMainWindow):
         if not (isinstance(selected, tuple) and len(selected) == 2):
             return
         provider_id, model_name = selected
-        spec = PROVIDER_SPECS[provider_id]
         self.settings.active_provider = provider_id
         self.settings.set_model_for(provider_id, model_name)
+        if is_custom_provider(provider_id):
+            # Picking a model from an endpoint also selects that endpoint, so
+            # the choice survives a restart as "<endpoint> · <model>".
+            store.set_active_endpoint(custom_endpoint_id(provider_id))
         try:
-            from dotenv import find_dotenv, set_key
-
-            env_path = find_dotenv(usecwd=True) or ".env"
-            set_key(env_path, "ACTIVE_PROVIDER", provider_id)
-            set_key(env_path, spec["model_env"], model_name)
+            values: dict[str, Any] = {"ACTIVE_PROVIDER": provider_id}
+            spec = PROVIDER_SPECS.get(provider_id)
+            if spec is not None and spec["model_env"]:
+                values[spec["model_env"]] = model_name
+            store.write_env_values(values)
         except Exception:  # noqa: BLE001
             pass
         self._chat_agent = None
         self._log(
             f'<span style="color:{self.t.accent};">Model → <b>{model_name}</b> '
-            f'({spec["label"]})</span>'
+            f'({provider_label(provider_id)})</span>'
         )
 
     # ── Disk overview ──────────────────────────────────────────────────────────
@@ -1798,10 +2126,11 @@ class PoofMacWindow(QMainWindow):
             )
 
         elif etype == "error":
-            text = event["text"]
+            # Provider errors are untrusted text rendered as HTML — escape it.
+            text = html.escape(str(event["text"])).replace("\n", "<br>")
             self._log(
                 f'<span style="color:{t.red};">'
-                f'<b>❌ Error:</b> {text.replace(chr(10), "<br>")}</span>'
+                f'<b>❌ Error:</b> {text}</span>'
             )
             provider_id = self.settings.get_active_provider()
             ready, detail = self.settings.provider_status(provider_id)
@@ -2070,8 +2399,6 @@ class PoofMacWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
-        if self._compat_models_worker and self._compat_models_worker.isRunning():
-            self._compat_models_worker.wait()
         super().closeEvent(event)
 
     def _open_settings(self) -> None:

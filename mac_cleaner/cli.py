@@ -44,7 +44,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-from pathlib import Path
 from typing import Optional
 
 from rich import box
@@ -56,13 +55,15 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from mac_cleaner import __version__
+from mac_cleaner import __version__, store
 from mac_cleaner.audit import AuditLogger
 from mac_cleaner.config import (
+    CUSTOM_PREFIX,
     MODEL_REGISTRY,
     PROVIDER_ORDER,
     PROVIDER_SPECS,
     Settings,
+    discover_models,
 )
 from mac_cleaner.executor import Executor
 from mac_cleaner.llm import CleanerAgent
@@ -304,7 +305,10 @@ def run_chat(
 
 # ── First-run setup wizard ─────────────────────────────────────────────────────
 
-_ENV_PATH = Path(".env")
+# Settings are written through the shared store, which resolves a writable
+# per-user path — never a bare relative ".env" (the bundled app's working
+# directory is "/", where that used to fail with Errno 30).
+_ENV_PATH = store.env_file()
 
 # One-line pitch per provider for the wizard menu. Everything else — model list,
 # env keys, whether a key is needed — comes from PROVIDER_SPECS.
@@ -331,17 +335,41 @@ _WIZARD_DEFAULTS = {
 }
 
 
-def _write_env(key: str, value: str) -> None:
-    """Upsert a key=value in the .env file (create if missing)."""
-    try:
-        from dotenv import set_key, find_dotenv
-        env_file = find_dotenv(usecwd=True) or str(_ENV_PATH)
-        _ENV_PATH.touch(exist_ok=True)
-        set_key(env_file, key, value)
-    except Exception:
-        # Fallback: append manually
-        with open(_ENV_PATH, "a") as f:
-            f.write(f"\n{key}={value}\n")
+def _write_env_many(values: dict[str, str]) -> None:
+    """Upsert keys in the settings file (create if missing)."""
+    store.write_env_values(values)
+
+
+def _choose_endpoint_model(base_url: str, api_key: str) -> tuple[str, list[str]]:
+    """Ask an endpoint which models it hosts, then let the user pick or type one.
+
+    Returns the chosen id and the full listing, so the answer can be remembered
+    for the GUI's model picker instead of being re-fetched on every start.
+    """
+    console.print(
+        f"  [dim]Asking {store.host_label(base_url)} which models it hosts…[/dim]"
+    )
+    models, error = discover_models(base_url, api_key)
+    if models:
+        console.print(f"\n  [green]✓[/green]  {len(models)} models found\n")
+        for i, model_id in enumerate(models, 1):
+            console.print(f"  [cyan]{i}[/cyan]  {model_id}")
+        console.print()
+        answer = Prompt.ask(
+            "  Enter a number, or type a model id", default="1", console=console
+        ).strip()
+        if answer.isdigit() and 1 <= int(answer) <= len(models):
+            return models[int(answer) - 1], models
+        return (answer or models[0]), models
+
+    # No listing is not fatal — some gateways hide /models behind auth.
+    console.print(f"\n  [yellow]Could not list models[/yellow] — {error}")
+    console.print(
+        "  [dim]Type the id exactly as the endpoint lists it. Settings → Custom\n"
+        "  endpoint can fetch the list later.[/dim]\n"
+    )
+    answer = Prompt.ask("  Model name", console=console).strip()
+    return answer, ([answer] if answer else [])
 
 
 def _is_configured(settings: Settings) -> bool:
@@ -386,9 +414,10 @@ def run_setup_wizard(settings: Settings) -> Settings:
 
     # ── Step 2: choose model ──────────────────────────────────────────────────
     base_url = ""
+    api_key = ""
+    endpoint_models: list[str] = []
     if spec["auth"] == "endpoint":
-        # Free-text model id: the endpoint's own /models list is the source.
-        console.print("[bold]Step 2 of 3 — Endpoint & model[/bold]\n")
+        console.print("[bold]Step 2 of 3 — Endpoint, key & model[/bold]\n")
         console.print(
             "  [dim]Any service that speaks the OpenAI chat-completions API works:[/dim]\n"
             "  [dim]vLLM · LM Studio · llama.cpp server · Ollama /v1 · Groq ·\n"
@@ -399,10 +428,14 @@ def run_setup_wizard(settings: Settings) -> Settings:
             default="http://localhost:11434/v1",
             console=console,
         ).strip()
-        chosen_model = Prompt.ask(
-            "  Model name (exactly as the endpoint lists it)",
-            console=console,
+        console.print(
+            "  [dim]Local servers (Ollama, LM Studio, llama.cpp, vLLM) usually need "
+            "no key — press Enter to skip.[/dim]\n"
+        )
+        api_key = Prompt.ask(
+            "  API key (optional)", password=True, default="", console=console
         ).strip()
+        chosen_model, endpoint_models = _choose_endpoint_model(base_url, api_key)
         chosen_desc = chosen_model
         console.print(
             f"\n  [green]✓[/green]  Selected: [bold]{chosen_model}</bold> "
@@ -426,7 +459,6 @@ def run_setup_wizard(settings: Settings) -> Settings:
         console.print(f"\n  [green]✓[/green]  Selected: [bold]{chosen_desc}[/bold]\n")
 
     # ── Step 3: credentials ───────────────────────────────────────────────────
-    api_key = ""
     if spec["auth"] == "signin":
         console.print(
             "[bold]Step 3 of 3 — Sign in[/bold]\n"
@@ -434,17 +466,11 @@ def run_setup_wizard(settings: Settings) -> Settings:
             f"(or from Settings). PoofMac reuses those credentials.\n"
         )
     elif spec["auth"] == "endpoint":
-        console.print("[bold]Step 3 of 3 — API key (optional)[/bold]\n")
+        # The URL, key and model were all settled in step 2.
         console.print(
-            "  [dim]Local servers (Ollama, LM Studio, llama.cpp, vLLM) usually need "
-            "no key — press Enter to skip.[/dim]\n"
+            f"  Nothing else needed — [bold]{store.host_label(base_url)}[/bold] "
+            f"is configured with {len(endpoint_models)} model(s).\n"
         )
-        api_key = Prompt.ask(
-            f"  Paste your {spec['key_env']} (optional)",
-            password=True,
-            default="",
-            console=console,
-        ).strip()
     elif spec["key_env"]:
         console.print(f"[bold]Step 3 of 3 — Enter your {spec['label']} API key[/bold]\n")
         console.print(f"  [dim]{spec['key_placeholder']}[/dim]")
@@ -468,9 +494,36 @@ def run_setup_wizard(settings: Settings) -> Settings:
         )
         console.print("  [dim]Once downloaded it will be available offline forever.[/dim]\n")
 
-    # ── Save to .env ──────────────────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────────
+    if spec["auth"] == "endpoint":
+        # Custom endpoints are stored as records, not as .env keys, so there is
+        # no "just this once" option: an unsaved endpoint could not be used.
+        if not base_url or not chosen_model:
+            console.print(
+                "\n  [yellow]No base URL or model given — nothing saved.[/yellow]\n"
+            )
+            return settings
+        endpoint = store.upsert_endpoint(
+            store.new_endpoint(
+                name=store.host_label(base_url),
+                base_url=base_url,
+                api_key=api_key,
+                model=chosen_model,
+                models=endpoint_models,
+            )
+        )
+        if endpoint is not None:
+            console.print(
+                f"\n  [green]✓[/green]  Saved to [bold]{store.endpoints_file()}[/bold] "
+                "— you won't need to do this again.\n"
+            )
+            configured = Settings()
+            configured.active_provider = f"{CUSTOM_PREFIX}{endpoint['id']}"
+            return configured
+        return settings
+
     save = Confirm.ask(
-        "  Save this configuration to .env for future runs?",
+        "  Save this configuration for future runs?",
         default=True,
         console=console,
     )
@@ -478,21 +531,18 @@ def run_setup_wizard(settings: Settings) -> Settings:
     def apply(target: Settings) -> None:
         target.active_provider = provider_id
         target.set_model_for(provider_id, chosen_model)
-        if base_url:
-            target.openai_compat_base_url = base_url
         if api_key:
             target.set_api_key(provider_id, api_key)
 
     if save:
-        _write_env("ACTIVE_PROVIDER", provider_id)
+        values = {"ACTIVE_PROVIDER": provider_id}
         if spec["model_env"]:
-            _write_env(spec["model_env"], chosen_model)
-        if base_url:
-            _write_env("OPENAI_COMPAT_BASE_URL", base_url)
+            values[spec["model_env"]] = chosen_model
         if api_key and spec["key_env"]:
-            _write_env(spec["key_env"], api_key)
+            values[spec["key_env"]] = api_key
+        _write_env_many(values)
         console.print(
-            "\n  [green]✓[/green]  Saved to [bold].env[/bold] — "
+            f"\n  [green]✓[/green]  Saved to [bold]{_ENV_PATH}[/bold] — "
             "you won't need to do this again.\n"
         )
     else:
@@ -501,16 +551,14 @@ def run_setup_wizard(settings: Settings) -> Settings:
         os.environ["ACTIVE_PROVIDER"] = provider_id
         if spec["model_env"]:
             os.environ[spec["model_env"]] = chosen_model
-        if base_url:
-            os.environ["OPENAI_COMPAT_BASE_URL"] = base_url
         if api_key and spec["key_env"]:
             os.environ[spec["key_env"]] = api_key
 
-    # Reload so new .env values take effect, then re-apply this selection on top.
+    # Reload so new values take effect, then re-apply this selection on top.
     try:
-        configured = Settings(_env_file=str(_ENV_PATH))  # type: ignore[call-arg]
-    except Exception:
         configured = Settings()
+    except Exception:
+        configured = settings
     apply(configured)
     return configured
 
@@ -526,12 +574,12 @@ def _handle_agent_exception(exc: Exception, json_mode: bool) -> None:
     if "authentication" in exc_str or "api key" in exc_str or "unauthorized" in exc_str:
         _print_error(
             "Authentication failed.\n\n"
-            "Check your API key in [bold].env[/bold]:\n"
+            f"Check your API key in [bold]{_ENV_PATH}[/bold]:\n"
             "  • Anthropic → ANTHROPIC_API_KEY\n"
             "  • OpenAI    → OPENAI_API_KEY\n"
             "  • OpenRouter → OPENROUTER_API_KEY\n"
             "  • Ollama Cloud → OLLAMA_API_KEY\n"
-            "  • Custom endpoint → OPENAI_COMPAT_API_KEY / OPENAI_COMPAT_BASE_URL"
+            f"  • Custom endpoints → {store.endpoints_file()}"
         )
     elif "connection refused" in exc_str or "ollama" in exc_str:
         _print_error(

@@ -2,6 +2,8 @@
 .env
 .env.local
 .env.*.local
+# Custom OpenAI-compatible endpoints (base URLs, keys, model lists)
+endpoints.json
 
 # Python
 __pycache__/

@@ -86,7 +86,12 @@ pip install -e .
 The first time you run any command, a setup wizard will guide you through
 picking an AI provider and saving your API key. No manual `.env` editing needed.
 
-To configure manually:
+To configure manually, copy `.env.example` to the settings file. PoofMac reads
+and writes `.env` in the directory you launch it from if one exists, otherwise
+`~/Library/Application Support/PoofMac/.env` (macOS) or
+`$XDG_CONFIG_HOME/poofmac/.env`. Custom OpenAI-compatible endpoints live beside
+it in `endpoints.json`. Point both somewhere else with `POOFMAC_ENV_FILE`.
+
 ```bash
 cp .env.example .env
 # Edit .env — add ANTHROPIC_API_KEY, OLLAMA_API_KEY, etc.
@@ -179,16 +184,30 @@ cloud account.
 ### Any OpenAI-compatible endpoint
 
 Already run a model server — or have a key to a service that speaks the OpenAI
-chat-completions API? Point PoofMac at it directly:
+chat-completions API? **Settings → Providers → Custom endpoints** holds any
+number of them, each with its own name, Base URL, key and model list, so a local
+server and a company gateway can coexist:
 
-```bash
-# .env
-OPENAI_COMPAT_BASE_URL=http://localhost:11434/v1   # or your server's /v1
-OPENAI_COMPAT_API_KEY=                            # blank is fine for local servers
-OPENAI_COMPAT_MODEL=qwen3.6:27b                   # exactly as the endpoint lists it
-```
+1. Press **＋ New**, give the endpoint a name, paste its Base URL
+   (`http://localhost:11434/v1`, `https://api.groq.com/openai/v1`, …) and its key
+   if it needs one.
+2. Press **Fetch models**. PoofMac asks the endpoint's `/models` API and fills
+   the dropdown; the listing is saved, so the main window's model picker shows
+   it without touching the network again. If the endpoint hides `/models`, the
+   status line says why and you can type an id by hand.
+3. Press **Save endpoint**, pick a model, then **Save & Close**.
 
-The same three settings live under **Settings → Providers → Custom endpoint** in the desktop GUI, and the setup wizard offers it as "Custom endpoint" on first run. Selecting it in Settings pins PoofMac to that endpoint even when other provider keys are also configured, and **Fetch models** fills the model list from the endpoint's `/models` API. You can always type an ID by hand if discovery is unsupported.
+The setup wizard offers the same flow on first run, and the endpoints are stored
+in `endpoints.json` next to `.env` (see [Configure your model](#configure-your-model)).
+Three legacy keys — `OPENAI_COMPAT_BASE_URL`, `OPENAI_COMPAT_API_KEY`,
+`OPENAI_COMPAT_MODEL` — are still read once, when no `endpoints.json` exists yet,
+and imported into it.
+
+Model ids are sent to the endpoint exactly as written. Gateways are strict about
+this: `nex-agi/nex-n2.5-pro:free` and `nex-n2.5-pro:free` are different models, so
+copy the id from the endpoint's own model list — **Fetch models** is the reliable
+way to get it right. If a gateway answers `404 model_not_found`, the app now says
+which id it sent and points at that button instead of showing a raw traceback.
 
 ### Copilot and Codex
 
