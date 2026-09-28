@@ -1117,8 +1117,8 @@ class SettingsDialog(QDialog):
             note = QLabel(
                 "Automatic picks the first provider that is fully configured, in this "
                 "order:\n\n"
-                "Anthropic → OpenRouter → OpenAI → Custom endpoint → "
-                "Ollama Cloud → Ollama Local.\n\n"
+                "Anthropic → OpenRouter → OpenAI → Custom endpoints → "
+                "Ollama Cloud → Ollama Local → Kilo Gateway (always ready).\n\n"
                 "Choose a provider on the left to pin it explicitly."
             )
             note.setWordWrap(True)
@@ -1142,6 +1142,20 @@ class SettingsDialog(QDialog):
             edit.setPlaceholderText(spec["key_placeholder"])
             self._key_edits[provider_id] = edit
             layout.addWidget(edit)
+
+        if provider_id == "kilo":
+            note = QLabel(
+                "Kilo Code's gateway serves a rotating set of free models to any "
+                "OpenAI-compatible client — no key and no account needed for the ids "
+                "marked free. Auto Free picks a healthy free model for you.\n\n"
+                "Free capacity is shared, so a model can be busy for a minute; pick "
+                "another or retry."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet(
+                f"font-size: 12px; color: {self.t.text_secondary}; background: transparent;"
+            )
+            layout.addWidget(note)
 
         layout.addWidget(QLabel("Model"))
         model_row = QHBoxLayout()

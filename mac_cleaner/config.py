@@ -57,6 +57,15 @@ MODEL_REGISTRY: dict[str, list[tuple[str, str]]] = {
         ("deepseek/deepseek-r1", "DeepSeek R1        (DeepSeek)"),
         ("meta-llama/llama-4-maverick", "Llama 4 Maverick   (Meta)"),
     ],
+    "kilo": [
+        ("kilo-auto/free", "Auto Free          — routes to a free model, recommended ★"),
+        ("nvidia/nemotron-3-super-120b-a12b:free", "Nemotron 3 Super   — 120B MoE, strong"),
+        ("qwen/qwen3.8-27b:free", "Qwen3.8 27B        — reliable tool-calls"),
+        ("inclusionai/ling-3.0-flash-fin:free", "Ling 3.0 Flash Fin — fast"),
+        ("stepfun/step-3.7-flash:free", "Step 3.7 Flash     — fast"),
+        ("thinkingmachines/inkling-small:free", "Inkling Small      — compact"),
+        ("cohere/north-mini-code:free", "North Mini Code    — Cohere"),
+    ],
     "ollama_cloud": [
         ("deepseek-v4-flash:cloud", "DeepSeek V4 Flash   — fast, free tier"),
         ("deepseek-v4-pro:cloud", "DeepSeek V4 Pro     — stronger"),
@@ -96,6 +105,19 @@ OLLAMA_PREFERRED_ORDER = [m for m, _ in MODEL_REGISTRY["ollama_local"]]
 #   install        shell command shown when that CLI is missing
 
 PROVIDER_SPECS: dict[str, dict[str, str]] = {
+    "kilo": {
+        "label": "Kilo Gateway (free)",
+        "registry": "kilo",
+        "litellm_prefix": "",
+        "model_env": "KILO_MODEL",
+        "model_attr": "kilo_model",
+        "key_env": "KILO_API_KEY",
+        "key_attr": "kilo_api_key",
+        "key_placeholder": "optional — the free ids work with no key",
+        "auth": "none",
+        "cli": "",
+        "install": "",
+    },
     "anthropic": {
         "label": "Anthropic",
         "registry": "anthropic",
@@ -227,6 +249,7 @@ PROVIDER_ORDER = [
     "github_copilot",
     "openai_codex",
     "openai_compat",
+    "kilo",
     "anthropic",
     "openrouter",
     "openai",
@@ -357,6 +380,8 @@ class Settings(BaseSettings):
     # Per-provider model ids. The legacy PREFERRED_CLOUD_MODEL /
     # PREFERRED_LOCAL_MODEL keys still seed these when a provider's own key
     # is absent, so existing .env files keep working.
+    kilo_model: str = Field(default="kilo-auto/free", alias="KILO_MODEL")
+    kilo_api_key: str = Field(default="", alias="KILO_API_KEY")
     anthropic_model: str = Field(default="", alias="ANTHROPIC_MODEL")
     openrouter_model: str = Field(default="", alias="OPENROUTER_MODEL")
     openai_model: str = Field(default="", alias="OPENAI_MODEL")
@@ -471,6 +496,8 @@ class Settings(BaseSettings):
         if spec["auth"] == "signin":
             return True, f"Signs in with the {spec['cli']} CLI on first use"
         if spec["key_env"] and not self.api_key_for(provider):
+            if provider == "kilo":
+                return True, "Ready · free ids need no key"
             return False, f"Add {spec['key_env']}"
         if provider == "ollama_local":
             model = self._detect_ollama_model()
@@ -513,13 +540,24 @@ class Settings(BaseSettings):
         if self._custom_endpoint_ready():
             return CUSTOM_ALIAS
         local = self.preferred_local_model
-        return "ollama_cloud" if local.endswith("-cloud") or ":cloud" in local else "ollama_local"
+        if local.endswith("-cloud") or ":cloud" in local:
+            # Ollama Cloud needs a key; without one, Kilo still works.
+            return "ollama_cloud" if self.ollama_api_key else "kilo"
+        # Kilo's free ids need no key, so they are the one provider that is
+        # always ready — a fresh install works before anything is configured,
+        # and a Mac without Ollama no longer dead-ends.
+        return "ollama_local" if self._detect_ollama_model() else "kilo"
 
     def set_model_override(self, model: str) -> None:
         self.set_model_for(self.get_active_provider(), model)
 
     def completion_kwargs(self) -> dict:
         """api_base/api_key for a custom endpoint; empty for every other provider."""
+        if self.get_active_provider() == "kilo":
+            return {
+                "api_base": "https://api.kilo.ai/api/gateway",
+                "api_key": self.kilo_api_key.strip() or "not-needed",
+            }
         endpoint = self.endpoint_for(self.get_active_provider())
         if endpoint is None:
             return {}
@@ -545,6 +583,9 @@ class Settings(BaseSettings):
             # gateway ids keep their slashes and suffixes exactly as typed
             # ("nex-agi/nex-n2.5-pro:free" → "nex-agi/nex-n2.5-pro:free").
             return f"openai/{model}", f"{model} ({endpoint.get('name') or store.host_label(base_url)})"
+        if provider == "kilo":
+            model = self.model_for("kilo") or "kilo-auto/free"
+            return f"openai/{model}", f"{model} (Kilo Gateway)"
         if provider in ("anthropic", "openrouter", "openai"):
             spec = PROVIDER_SPECS[provider]
             key = self.api_key_for(provider)
