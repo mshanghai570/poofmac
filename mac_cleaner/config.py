@@ -77,6 +77,153 @@ MODEL_REGISTRY: dict[str, list[tuple[str, str]]] = {
 
 OLLAMA_PREFERRED_ORDER = [m for m, _ in MODEL_REGISTRY["ollama_local"]]
 
+# ── Provider specifications ───────────────────────────────────────────────────
+# One row per provider. The GUI, the CLI wizard and the model picker all read
+# this table, so adding a provider means editing it here and nowhere else.
+#
+#   key            env key / settings attribute suffix
+#   label          shown in settings, the picker and the wizard
+#   registry       key into MODEL_REGISTRY
+#   litellm_prefix prepended to the model id ("" = use the id as-is)
+#   model_env      .env key holding the selected model
+#   model_attr     Settings attribute holding the selected model
+#   key_env        .env key holding the API key ("" = no API key)
+#   key_attr       Settings attribute holding the API key
+#   auth           "api_key" | "endpoint" | "signin" | "none"
+#   cli            executable that signs the user in, for auth="signin"
+#   install        shell command shown when that CLI is missing
+
+PROVIDER_SPECS: dict[str, dict[str, str]] = {
+    "anthropic": {
+        "label": "Anthropic",
+        "registry": "anthropic",
+        "litellm_prefix": "",
+        "model_env": "ANTHROPIC_MODEL",
+        "model_attr": "anthropic_model",
+        "key_env": "ANTHROPIC_API_KEY",
+        "key_attr": "anthropic_api_key",
+        "key_placeholder": "sk-ant-…  →  console.anthropic.com",
+        "auth": "api_key",
+        "cli": "",
+        "install": "",
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "registry": "openrouter",
+        "litellm_prefix": "openrouter/",
+        "model_env": "OPENROUTER_MODEL",
+        "model_attr": "openrouter_model",
+        "key_env": "OPENROUTER_API_KEY",
+        "key_attr": "openrouter_api_key",
+        "key_placeholder": "sk-or-…  →  openrouter.ai",
+        "auth": "api_key",
+        "cli": "",
+        "install": "",
+    },
+    "openai": {
+        "label": "OpenAI",
+        "registry": "openai",
+        "litellm_prefix": "",
+        "model_env": "OPENAI_MODEL",
+        "model_attr": "openai_model",
+        "key_env": "OPENAI_API_KEY",
+        "key_attr": "openai_api_key",
+        "key_placeholder": "sk-…  →  platform.openai.com",
+        "auth": "api_key",
+        "cli": "",
+        "install": "",
+    },
+    "github_copilot": {
+        "label": "GitHub Copilot",
+        "registry": "github_copilot",
+        "litellm_prefix": "github_copilot/",
+        "model_env": "GITHUB_COPILOT_MODEL",
+        "model_attr": "github_copilot_model",
+        "key_env": "",
+        "key_attr": "",
+        "key_placeholder": "",
+        "auth": "signin",
+        "cli": "copilot",
+        "install": "npm install -g @github/copilot",
+    },
+    "openai_codex": {
+        "label": "OpenAI Codex",
+        "registry": "openai_codex",
+        "litellm_prefix": "chatgpt/",
+        "model_env": "OPENAI_CODEX_MODEL",
+        "model_attr": "openai_codex_model",
+        "key_env": "",
+        "key_attr": "",
+        "key_placeholder": "",
+        "auth": "signin",
+        "cli": "codex",
+        "install": "npm install -g @openai/codex",
+    },
+    "openai_compat": {
+        "label": "Custom endpoint",
+        "registry": "",
+        "litellm_prefix": "openai/",
+        "model_env": "OPENAI_COMPAT_MODEL",
+        "model_attr": "openai_compat_model",
+        "key_env": "OPENAI_COMPAT_API_KEY",
+        "key_attr": "openai_compat_api_key",
+        "key_placeholder": "optional — local servers need none",
+        "auth": "endpoint",
+        "cli": "",
+        "install": "",
+    },
+    "ollama_cloud": {
+        "label": "Ollama Cloud",
+        "registry": "ollama_cloud",
+        "litellm_prefix": "ollama/",
+        "model_env": "OLLAMA_CLOUD_MODEL",
+        "model_attr": "ollama_cloud_model",
+        "key_env": "OLLAMA_API_KEY",
+        "key_attr": "ollama_api_key",
+        "key_placeholder": "ollama.com subscription key",
+        "auth": "api_key",
+        "cli": "",
+        "install": "",
+    },
+    "ollama_local": {
+        "label": "Ollama Local",
+        "registry": "ollama_local",
+        "litellm_prefix": "ollama/",
+        "model_env": "OLLAMA_LOCAL_MODEL",
+        "model_attr": "ollama_local_model",
+        "key_env": "",
+        "key_attr": "",
+        "key_placeholder": "",
+        "auth": "none",
+        "cli": "",
+        "install": "",
+    },
+}
+
+# Selection order in settings and the wizard. "auto" is the fallback mode and
+# is not a provider row, so it lives outside the table.
+PROVIDER_ORDER = [
+    "github_copilot",
+    "openai_codex",
+    "openai_compat",
+    "anthropic",
+    "openrouter",
+    "openai",
+    "ollama_cloud",
+    "ollama_local",
+]
+
+# Providers that predate per-provider model keys. Existing .env files still
+# set PREFERRED_CLOUD_MODEL / PREFERRED_LOCAL_MODEL, so those seed the
+# per-provider value when the specific key is absent.
+_SHARED_MODEL_ATTRS = {
+    "anthropic": "preferred_cloud_model",
+    "openrouter": "preferred_cloud_model",
+    "openai": "preferred_cloud_model",
+    "ollama_cloud": "preferred_local_model",
+    "ollama_local": "preferred_local_model",
+}
+
 
 def discover_openai_compat_models(
     base_url: str, api_key: str = "", timeout: float = 8.0
@@ -119,21 +266,89 @@ class Settings(BaseSettings):
     )
 
     active_provider: str = Field(default="auto", alias="ACTIVE_PROVIDER")
+
+    # Per-provider model ids. The legacy PREFERRED_CLOUD_MODEL /
+    # PREFERRED_LOCAL_MODEL keys still seed these when a provider's own key
+    # is absent, so existing .env files keep working.
+    anthropic_model: str = Field(default="", alias="ANTHROPIC_MODEL")
+    openrouter_model: str = Field(default="", alias="OPENROUTER_MODEL")
+    openai_model: str = Field(default="", alias="OPENAI_MODEL")
     github_copilot_model: str = Field(default="gpt-5.2", alias="GITHUB_COPILOT_MODEL")
     openai_codex_model: str = Field(default="gpt-5.3-codex", alias="OPENAI_CODEX_MODEL")
+    openai_compat_model: str = Field(default="", alias="OPENAI_COMPAT_MODEL")
+    ollama_cloud_model: str = Field(default="", alias="OLLAMA_CLOUD_MODEL")
+    ollama_local_model: str = Field(default="", alias="OLLAMA_LOCAL_MODEL")
 
     anthropic_api_key: str = Field(default="", alias="ANTHROPIC_API_KEY")
     openrouter_api_key: str = Field(default="", alias="OPENROUTER_API_KEY")
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
     ollama_api_key: str = Field(default="", alias="OLLAMA_API_KEY")
+    openai_compat_api_key: str = Field(default="", alias="OPENAI_COMPAT_API_KEY")
 
     openai_compat_base_url: str = Field(default="", alias="OPENAI_COMPAT_BASE_URL")
-    openai_compat_api_key: str = Field(default="", alias="OPENAI_COMPAT_API_KEY")
-    openai_compat_model: str = Field(default="", alias="OPENAI_COMPAT_MODEL")
 
     preferred_cloud_model: str = Field(default="claude-sonnet-4-6", alias="PREFERRED_CLOUD_MODEL")
     preferred_local_model: str = Field(default="qwen2.5:14b", alias="PREFERRED_LOCAL_MODEL")
     safe_mode: bool = Field(default=False, alias="SAFE_MODE")
+
+    # ── Per-provider accessors ────────────────────────────────────────────────
+
+    def model_for(self, provider: str) -> str:
+        """Selected model id for a provider, falling back to the legacy keys."""
+        spec = PROVIDER_SPECS.get(provider)
+        if spec is None:
+            return ""
+        model = getattr(self, spec["model_attr"], "").strip()
+        if model:
+            return model
+        legacy = _SHARED_MODEL_ATTRS.get(provider)
+        if legacy:
+            return getattr(self, legacy, "").strip()
+        return ""
+
+    def set_model_for(self, provider: str, model: str) -> None:
+        spec = PROVIDER_SPECS.get(provider)
+        if spec:
+            setattr(self, spec["model_attr"], model)
+
+    def api_key_for(self, provider: str) -> str:
+        spec = PROVIDER_SPECS.get(provider)
+        return getattr(self, spec["key_attr"], "") if spec and spec["key_attr"] else ""
+
+    def set_api_key(self, provider: str, key: str) -> None:
+        spec = PROVIDER_SPECS.get(provider)
+        if spec and spec["key_attr"]:
+            setattr(self, spec["key_attr"], key)
+
+    def provider_status(self, provider: str) -> tuple[bool, str]:
+        """Whether a provider is usable, and a one-line reason when it is not.
+
+        Drives both the per-row status in Settings and the preflight message
+        the chat prints before a request, so the wording cannot drift apart.
+        """
+        spec = PROVIDER_SPECS.get(provider)
+        if spec is None:
+            return False, f"Unknown provider: {provider}"
+        if spec["auth"] == "signin":
+            return True, f"Signs in with the {spec['cli']} CLI on first use"
+        if spec["auth"] == "endpoint":
+            if not self.openai_compat_base_url.strip():
+                return False, "Add a Base URL"
+            if not self.model_for(provider):
+                return False, "Add a model ID"
+            return True, f"Ready · {self._compat_host()}"
+        if spec["key_env"] and not self.api_key_for(provider):
+            return False, f"Add {spec['key_env']}"
+        if provider == "ollama_local":
+            model = self._detect_ollama_model()
+            if not model:
+                return False, "No local Ollama model — run: ollama pull " + self.model_for(provider)
+            return True, f"Ready · {model}"
+        if not self.model_for(provider):
+            return False, "Choose a model"
+        return True, "Ready"
+
+    # ── Active provider resolution ────────────────────────────────────────────
 
     def _use_openai_compat(self) -> bool:
         configured = bool(self.openai_compat_base_url.strip() and self.openai_compat_model.strip())
@@ -162,17 +377,7 @@ class Settings(BaseSettings):
         return "ollama_cloud" if local.endswith("-cloud") or ":cloud" in local else "ollama_local"
 
     def set_model_override(self, model: str) -> None:
-        provider = self.get_active_provider()
-        if provider == "github_copilot":
-            self.github_copilot_model = model
-        elif provider == "openai_codex":
-            self.openai_codex_model = model
-        elif provider == "openai_compat":
-            self.openai_compat_model = model
-        elif provider in ("anthropic", "openrouter", "openai"):
-            self.preferred_cloud_model = model
-        else:
-            self.preferred_local_model = model
+        self.set_model_for(self.get_active_provider(), model)
 
     def completion_kwargs(self) -> dict:
         if not self._use_openai_compat():
@@ -184,12 +389,6 @@ class Settings(BaseSettings):
 
     def get_active_model(self) -> tuple[str, str]:
         provider = self.get_active_provider()
-        if provider == "github_copilot":
-            model = self.github_copilot_model.strip() or "gpt-5.2"
-            return f"github_copilot/{model}", f"{model} (GitHub Copilot)"
-        if provider == "openai_codex":
-            model = self.openai_codex_model.strip() or "gpt-5.3-codex"
-            return f"chatgpt/{model}", f"{model} (ChatGPT subscription)"
         if provider == "openai_compat":
             if not (self.openai_compat_base_url.strip() and self.openai_compat_model.strip()):
                 raise RuntimeError(
@@ -199,18 +398,10 @@ class Settings(BaseSettings):
             model = self.openai_compat_model.strip()
             return f"openai/{model}", f"{model} (Custom · {self._compat_host()})"
         if provider in ("anthropic", "openrouter", "openai"):
-            key_name = {
-                "anthropic": "ANTHROPIC_API_KEY",
-                "openrouter": "OPENROUTER_API_KEY",
-                "openai": "OPENAI_API_KEY",
-            }[provider]
-            key = {
-                "anthropic": self.anthropic_api_key,
-                "openrouter": self.openrouter_api_key,
-                "openai": self.openai_api_key,
-            }[provider]
+            spec = PROVIDER_SPECS[provider]
+            key = self.api_key_for(provider)
             if not key:
-                raise RuntimeError(f"{key_name} is required for the selected provider.")
+                raise RuntimeError(f"{spec['key_env']} is required for {spec['label']}.")
             import litellm
             if provider == "anthropic":
                 litellm.anthropic_key = key
@@ -218,64 +409,30 @@ class Settings(BaseSettings):
                 litellm.openrouter_key = key
             else:
                 litellm.openai_key = key
-            model = self.preferred_cloud_model
-            if provider == "openai" and not model:
-                model = "gpt-4o"
+            model = self.model_for(provider) or MODEL_REGISTRY[spec["registry"]][0][0]
             if provider == "openrouter":
                 if "/" not in model:
                     model = f"openrouter/anthropic/{model}"
                 elif not model.startswith("openrouter/"):
                     model = f"openrouter/{model}"
                 return model, f"{model.split('/')[-1]} (OpenRouter)"
-            return model, f"{model} ({provider.capitalize()})"
+            return model, f"{model} ({spec['label']})"
+        if provider in ("github_copilot", "openai_codex"):
+            spec = PROVIDER_SPECS[provider]
+            model = self.model_for(provider)
+            label = "GitHub Copilot" if provider == "github_copilot" else "ChatGPT subscription"
+            return f"{spec['litellm_prefix']}{model}", f"{model} ({label})"
         if provider == "ollama_cloud":
             if not self.ollama_api_key:
                 raise RuntimeError("OLLAMA_API_KEY is required for Ollama Cloud.")
-            model = self.preferred_local_model
+            model = self.model_for("ollama_cloud")
             return f"ollama/{model}", f"{model} (Ollama Cloud)"
         if provider == "ollama_local":
             model = self._detect_ollama_model()
             if not model or model.endswith("-cloud") or ":cloud" in model:
                 raise RuntimeError("Cannot reach a local Ollama model. Start Ollama and pull a model.")
             return f"ollama/{model}", f"{model} (Ollama Local)"
-        if provider != "auto":
-            raise RuntimeError(f"Unknown active provider: {provider}")
-
-        # Automatic uses the legacy priority: Anthropic, OpenRouter, OpenAI,
-        # OpenAI-compatible endpoint, then Ollama.
-        if self.anthropic_api_key:
-            import litellm
-            litellm.anthropic_key = self.anthropic_api_key
-            return self.preferred_cloud_model, f"{self.preferred_cloud_model} (Anthropic)"
-        if self.openrouter_api_key:
-            import litellm
-            litellm.openrouter_key = self.openrouter_api_key
-            model = self.preferred_cloud_model
-            if "/" not in model:
-                model = f"openrouter/anthropic/{model}"
-            elif not model.startswith("openrouter/"):
-                model = f"openrouter/{model}"
-            return model, f"{model.split('/')[-1]} (OpenRouter)"
-        if self.openai_api_key:
-            import litellm
-            litellm.openai_key = self.openai_api_key
-            model = self.preferred_cloud_model or "gpt-4o"
-            return model, f"{model} (OpenAI)"
-        if self._use_openai_compat():
-            model = self.openai_compat_model.strip()
-            return f"openai/{model}", f"{model} (Custom · {self._compat_host()})"
-        model = self._detect_ollama_model()
-        if model:
-            return f"ollama/{model}", f"{model} (Ollama)"
-        raise RuntimeError(
-            "No model configured and Ollama not found.\n\n"
-            "Options:\n"
-            "  1. Add ANTHROPIC_API_KEY to .env\n"
-            "  2. Add OPENROUTER_API_KEY or OPENAI_API_KEY to .env\n"
-            "  3. Add OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_MODEL to .env\n"
-            "  4. Install Ollama and pull a model: ollama pull "
-            f"{self.preferred_local_model}"
-        )
+        raise RuntimeError(f"Unknown active provider: {provider}")
 
     def _compat_host(self) -> str:
         from urllib.parse import urlparse
@@ -286,29 +443,31 @@ class Settings(BaseSettings):
             return raw
 
     def _detect_ollama_model(self) -> Optional[str]:
-        try:
-            subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5)
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return None
-        preferred = self.preferred_local_model
+        """Best local Ollama model: the saved one, else a known one, else any."""
+        preferred = self.model_for("ollama_local") or self.preferred_local_model
         tag = preferred.split(":")[-1] if ":" in preferred else ""
         if tag == "cloud" or tag.endswith("-cloud"):
             return preferred
         try:
-            proc = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=5)
-            if proc.returncode != 0:
-                return None
-            available = [line.split()[0] for line in proc.stdout.strip().splitlines()[1:] if line.strip()]
-            for model in available:
-                if preferred in model or model.startswith(preferred.split(":")[0]):
-                    return model
-            for fallback in OLLAMA_PREFERRED_ORDER:
-                for model in available:
-                    if fallback.split(":")[0] in model:
-                        return model
-            return available[0] if available else None
+            proc = subprocess.run(
+                ["ollama", "list"], capture_output=True, text=True, timeout=5
+            )
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return None
+        if proc.returncode != 0:
+            return None
+        available = [line.split()[0] for line in proc.stdout.strip().splitlines()[1:] if line.strip()]
+        if not available:
+            return None
+        family = preferred.split(":")[0]
+        for model in available:
+            if preferred in model or model.startswith(family):
+                return model
+        for known in OLLAMA_PREFERRED_ORDER:
+            for model in available:
+                if known.split(":")[0] in model:
+                    return model
+        return available[0]
 
     def validate_model_access(self) -> tuple[bool, str]:
         try:

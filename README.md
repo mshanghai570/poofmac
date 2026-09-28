@@ -188,13 +188,13 @@ OPENAI_COMPAT_API_KEY=                            # blank is fine for local serv
 OPENAI_COMPAT_MODEL=qwen3.6:27b                   # exactly as the endpoint lists it
 ```
 
-The same three settings live under **Settings → Custom** in the desktop GUI, and
-the setup wizard offers it as "OpenAI-compatible (custom endpoint)" on first run.
-Select **Custom OpenAI-compatible endpoint** in **Settings → Models** to use it even when other provider keys are also configured. In the Models tab or main model selector, the model list is fetched from the endpoint's `/models` API when available; you can enter an ID manually if discovery is unsupported.
+The same three settings live under **Settings → Providers → Custom endpoint** in the desktop GUI, and the setup wizard offers it as "Custom endpoint" on first run. Selecting it in Settings pins PoofMac to that endpoint even when other provider keys are also configured, and **Fetch models** fills the model list from the endpoint's `/models` API. You can always type an ID by hand if discovery is unsupported.
 
 ### Copilot and Codex
 
-In **Settings → Models**, select GitHub Copilot or OpenAI Codex (ChatGPT subscription), then choose a model. LiteLLM prompts for its OAuth device sign-in on the first request; a CLI executable is not required for these model backends. The desktop model menu also includes these models once selected.
+**Settings → Providers → GitHub Copilot** and **→ OpenAI Codex** each have their own model list and a **Sign in** button. The button runs `copilot login` or `codex login` and shows the output in the dialog, so you never have to leave the app; if the CLI is missing it tells you the install command. Credentials are stored by the CLI itself, so signing in is a one-time step.
+
+Note that these are two separate sign-ins: the button authenticates the **CLI** (used by `poofmac tools run copilot`), while the model backend uses LiteLLM's own OAuth device flow, which prompts on your first scan.
 
 ### External coding-agent CLIs
 

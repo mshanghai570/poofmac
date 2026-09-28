@@ -58,7 +58,12 @@ from rich.text import Text
 
 from mac_cleaner import __version__
 from mac_cleaner.audit import AuditLogger
-from mac_cleaner.config import Settings, MODEL_REGISTRY
+from mac_cleaner.config import (
+    MODEL_REGISTRY,
+    PROVIDER_ORDER,
+    PROVIDER_SPECS,
+    Settings,
+)
 from mac_cleaner.executor import Executor
 from mac_cleaner.llm import CleanerAgent
 from mac_cleaner.scanner import format_size, get_disk_usage
@@ -301,84 +306,29 @@ def run_chat(
 
 _ENV_PATH = Path(".env")
 
-_PROVIDERS = [
-    {
-        "key":     "anthropic",
-        "label":   "Anthropic (Claude)",
-        "note":    "Fastest & most reliable  —  anthropic.com/api",
-        "env_key": "ANTHROPIC_API_KEY",
-        "models":  MODEL_REGISTRY["anthropic"],
-        "default": "claude-sonnet-4-6",
-        "setting": "PREFERRED_CLOUD_MODEL",
-    },
-    {
-        "key":      "github_copilot",
-        "label":    "GitHub Copilot",
-        "note":     "Use your Copilot subscription — authenticates via GitHub device flow",
-        "env_key":  None,
-        "models":   MODEL_REGISTRY["github_copilot"],
-        "default":  "gpt-5.2",
-        "setting":  "GITHUB_COPILOT_MODEL",
-        "native_auth": True,
-    },
-    {
-        "key":      "openai_codex",
-        "label":    "OpenAI Codex (ChatGPT subscription)",
-        "note":     "Use Codex models via your ChatGPT subscription — authenticates via device flow",
-        "env_key":  None,
-        "models":   MODEL_REGISTRY["openai_codex"],
-        "default":  "gpt-5.3-codex",
-        "setting":  "OPENAI_CODEX_MODEL",
-        "native_auth": True,
-    },
-    {
-        "key":     "openai",
-        "label":   "OpenAI (GPT)",
-        "note":    "Reliable cloud option  —  platform.openai.com",
-        "env_key": "OPENAI_API_KEY",
-        "models":  MODEL_REGISTRY["openai"],
-        "default": "gpt-4o",
-        "setting": "PREFERRED_CLOUD_MODEL",
-    },
-    {
-        "key":      "openai_compat",
-        "label":    "OpenAI-compatible (custom endpoint)",
-        "note":     "vLLM, LM Studio, Ollama /v1, Groq, DeepSeek …  —  any OpenAI-compatible API",
-        "env_key":  "OPENAI_COMPAT_API_KEY",
-        "models":   [],          # free-text model id — typed in step 2
-        "default":  "",
-        "setting":  "OPENAI_COMPAT_MODEL",
-        "custom":   True,
-        "base_url": "OPENAI_COMPAT_BASE_URL",
-    },
-    {
-        "key":     "openrouter",
-        "label":   "OpenRouter",
-        "note":    "One key, many models  —  openrouter.ai",
-        "env_key": "OPENROUTER_API_KEY",
-        "models":  MODEL_REGISTRY["openrouter"],
-        "default": "anthropic/claude-sonnet-4-6",
-        "setting": "PREFERRED_CLOUD_MODEL",
-    },
-    {
-        "key":     "ollama_cloud",
-        "label":   "Ollama Cloud",
-        "note":    "Your Ollama subscription  —  ollama.com",
-        "env_key": "OLLAMA_API_KEY",
-        "models":  MODEL_REGISTRY["ollama_cloud"],
-        "default": "gemma4:31b-cloud",
-        "setting": "PREFERRED_LOCAL_MODEL",
-    },
-    {
-        "key":     "ollama_local",
-        "label":   "Ollama Local (free, runs on this Mac)",
-        "note":    "No API key needed — model downloads once  —  ollama.com",
-        "env_key": None,
-        "models":  MODEL_REGISTRY["ollama_local"],
-        "default": "qwen3.6:8b",
-        "setting": "PREFERRED_LOCAL_MODEL",
-    },
-]
+# One-line pitch per provider for the wizard menu. Everything else — model list,
+# env keys, whether a key is needed — comes from PROVIDER_SPECS.
+_WIZARD_NOTES = {
+    "github_copilot": "Your Copilot subscription — signs in with the copilot CLI",
+    "openai_codex": "ChatGPT subscription — signs in with the codex CLI",
+    "openai_compat": "vLLM · LM Studio · Ollama /v1 · Groq — any OpenAI-compatible API",
+    "anthropic": "Fastest & most reliable  —  console.anthropic.com",
+    "openrouter": "One key, many models  —  openrouter.ai",
+    "openai": "Reliable cloud option  —  platform.openai.com",
+    "ollama_cloud": "Your Ollama subscription  —  ollama.com",
+    "ollama_local": "Free, runs on this Mac — model downloads once",
+}
+
+# The model each provider should preselect in the wizard list.
+_WIZARD_DEFAULTS = {
+    "github_copilot": "gpt-5.2",
+    "openai_codex": "gpt-5.3-codex",
+    "anthropic": "claude-sonnet-4-6",
+    "openrouter": "anthropic/claude-sonnet-4-6",
+    "openai": "gpt-4o",
+    "ollama_cloud": "gemma4:31b-cloud",
+    "ollama_local": "qwen3.6:8b",
+}
 
 
 def _write_env(key: str, value: str) -> None:
@@ -396,23 +346,7 @@ def _write_env(key: str, value: str) -> None:
 
 def _is_configured(settings: Settings) -> bool:
     """Return whether the selected backend has enough configuration to start."""
-    provider = settings.get_active_provider()
-    if provider in ("github_copilot", "openai_codex"):
-        # LiteLLM prompts for the provider's OAuth device flow on first use.
-        return True
-    if provider == "openai_compat":
-        return bool(settings.openai_compat_base_url and settings.openai_compat_model)
-    if provider == "anthropic":
-        return bool(settings.anthropic_api_key)
-    if provider == "openrouter":
-        return bool(settings.openrouter_api_key)
-    if provider == "openai":
-        return bool(settings.openai_api_key)
-    if provider == "ollama_cloud":
-        return bool(settings.ollama_api_key)
-    if provider == "ollama_local":
-        return bool(settings.preferred_local_model)
-    return False
+    return settings.provider_status(settings.get_active_provider())[0]
 
 
 def run_setup_wizard(settings: Settings) -> Settings:
@@ -435,108 +369,95 @@ def run_setup_wizard(settings: Settings) -> Settings:
 
     # ── Step 1: choose provider ───────────────────────────────────────────────
     console.print("[bold]Step 1 of 3 — Choose an AI provider[/bold]\n")
-    for i, p in enumerate(_PROVIDERS, 1):
-        console.print(f"  [cyan]{i}[/cyan]  [bold]{p['label']}[/bold]")
-        console.print(f"     [dim]{p['note']}[/dim]")
+    for i, provider_id in enumerate(PROVIDER_ORDER, 1):
+        console.print(f"  [cyan]{i}[/cyan]  [bold]{PROVIDER_SPECS[provider_id]['label']}[/bold]")
+        console.print(f"     [dim]{_WIZARD_NOTES[provider_id]}[/dim]")
     console.print()
 
-    while True:
-        choice = Prompt.ask(
-            "  Enter a number",
-            choices=[str(i) for i in range(1, len(_PROVIDERS) + 1)],
-            console=console,
-        )
-        provider = _PROVIDERS[int(choice) - 1]
-        break
-
+    choice = Prompt.ask(
+        "  Enter a number",
+        choices=[str(i) for i in range(1, len(PROVIDER_ORDER) + 1)],
+        console=console,
+    )
+    provider_id = PROVIDER_ORDER[int(choice) - 1]
+    spec = PROVIDER_SPECS[provider_id]
+    models = MODEL_REGISTRY.get(spec["registry"], [])
     console.print()
 
     # ── Step 2: choose model ──────────────────────────────────────────────────
     base_url = ""
-    if provider.get("custom"):
-        # OpenAI-compatible endpoint — free-text base URL + model id
+    if spec["auth"] == "endpoint":
+        # Free-text model id: the endpoint's own /models list is the source.
         console.print("[bold]Step 2 of 3 — Endpoint & model[/bold]\n")
         console.print(
             "  [dim]Any service that speaks the OpenAI chat-completions API works:[/dim]\n"
             "  [dim]vLLM · LM Studio · llama.cpp server · Ollama /v1 · Groq ·\n"
-            "  DeepSeek · Together · proxies · even a real OpenAI base URL[/dim]\n"
+            "  [dim]DeepSeek · Together · proxies · even a real OpenAI base URL[/dim]\n"
         )
-        while True:
-            base_url = Prompt.ask(
-                "  Base URL",
-                default="http://localhost:11434/v1",
-                console=console,
-            ).strip()
-            if base_url:
-                break
-        while True:
-            chosen_model = Prompt.ask(
-                "  Model name (exactly as the endpoint lists it)",
-                console=console,
-            ).strip()
-            if chosen_model:
-                break
+        base_url = Prompt.ask(
+            "  Base URL",
+            default="http://localhost:11434/v1",
+            console=console,
+        ).strip()
+        chosen_model = Prompt.ask(
+            "  Model name (exactly as the endpoint lists it)",
+            console=console,
+        ).strip()
         chosen_desc = chosen_model
         console.print(
-            f"\n  [green]✓[/green]  Selected: [bold]{chosen_model}[/bold] "
+            f"\n  [green]✓[/green]  Selected: [bold]{chosen_model}</bold> "
             f"at [bold]{base_url}[/bold]\n"
         )
     else:
-        console.print(f"[bold]Step 2 of 3 — Choose a model[/bold]\n")
-        for i, (model_id, desc) in enumerate(provider["models"], 1):
-            recommended = " [dim](recommended)[/dim]" if model_id == provider["default"] else ""
-            console.print(f"  [cyan]{i}[/cyan]  {desc}{recommended}")
+        console.print("[bold]Step 2 of 3 — Choose a model[/bold]\n")
+        recommended = _WIZARD_DEFAULTS.get(provider_id, "")
+        for i, (model_id, desc) in enumerate(models, 1):
+            mark = " [dim](recommended)[/dim]" if model_id == recommended else ""
+            console.print(f"  [cyan]{i}[/cyan]  {desc}{mark}")
         console.print()
 
-        while True:
-            model_choice = Prompt.ask(
-                "  Enter a number",
-                default="1",
-                choices=[str(i) for i in range(1, len(provider["models"]) + 1)],
-                console=console,
-            )
-            chosen_model, chosen_desc = provider["models"][int(model_choice) - 1]
-            break
-
+        model_choice = Prompt.ask(
+            "  Enter a number",
+            default="1",
+            choices=[str(i) for i in range(1, len(models) + 1)],
+            console=console,
+        )
+        chosen_model, chosen_desc = models[int(model_choice) - 1]
         console.print(f"\n  [green]✓[/green]  Selected: [bold]{chosen_desc}[/bold]\n")
 
-    # ── Step 3: credentials / native OAuth / local Ollama ─────────────────────
+    # ── Step 3: credentials ───────────────────────────────────────────────────
     api_key = ""
-    if provider.get("native_auth"):
+    if spec["auth"] == "signin":
         console.print(
-            "[bold]Step 3 of 3 — Sign in on first use[/bold]\n"
-            "  LiteLLM will display a verification URL and device code the first "
-            "time you run a scan. No API key is required.\n"
+            "[bold]Step 3 of 3 — Sign in[/bold]\n"
+            f"  Run [bold cyan]{spec['cli']} login[/bold cyan] once, in a terminal "
+            f"(or from Settings). PoofMac reuses those credentials.\n"
         )
-    elif provider.get("custom"):
-        console.print(
-            f"[bold]Step 3 of 3 — Enter your {provider['label']} API key[/bold]\n"
-        )
+    elif spec["auth"] == "endpoint":
+        console.print("[bold]Step 3 of 3 — API key (optional)[/bold]\n")
         console.print(
             "  [dim]Local servers (Ollama, LM Studio, llama.cpp, vLLM) usually need "
             "no key — press Enter to skip.[/dim]\n"
         )
         api_key = Prompt.ask(
-            f"  Paste your {provider['env_key']} (optional)",
+            f"  Paste your {spec['key_env']} (optional)",
             password=True,
             default="",
             console=console,
         ).strip()
-    elif provider["env_key"]:
-        console.print(f"[bold]Step 3 of 3 — Enter your {provider['label']} API key[/bold]\n")
-        console.print(f"  [dim]Get your key at: {provider['note'].split('—')[-1].strip()}[/dim]")
-        console.print(f"  [dim]It will only be stored locally in your .env file.[/dim]\n")
-
+    elif spec["key_env"]:
+        console.print(f"[bold]Step 3 of 3 — Enter your {spec['label']} API key[/bold]\n")
+        console.print(f"  [dim]{spec['key_placeholder']}[/dim]")
+        console.print("  [dim]It will only be stored locally in your .env file.[/dim]\n")
         api_key = Prompt.ask(
-            f"  Paste your {provider['env_key']}",
+            f"  Paste your {spec['key_env']}",
             password=True,
             console=console,
         ).strip()
-
         if not api_key:
             console.print("\n  [yellow]No key entered — skipping.[/yellow]")
             console.print(
-                f"  [dim]Add it manually to .env:  {provider['env_key']}=your_key_here[/dim]\n"
+                f"  [dim]Add it manually to .env:  {spec['key_env']}=your_key_here[/dim]\n"
             )
     else:
         console.print("[bold]Step 3 of 3 — Local model setup[/bold]\n")
@@ -545,9 +466,7 @@ def run_setup_wizard(settings: Settings) -> Settings:
             f"  [bold cyan]  ollama pull {chosen_model}[/bold cyan]\n\n"
             f"  [dim](~5–20 GB download depending on model size)[/dim]\n"
         )
-        console.print(
-            "  [dim]Once downloaded it will be available offline forever.[/dim]\n"
-        )
+        console.print("  [dim]Once downloaded it will be available offline forever.[/dim]\n")
 
     # ── Save to .env ──────────────────────────────────────────────────────────
     save = Confirm.ask(
@@ -556,46 +475,43 @@ def run_setup_wizard(settings: Settings) -> Settings:
         console=console,
     )
 
-    if save:
-        _write_env("ACTIVE_PROVIDER", provider["key"])
-        _write_env(provider["setting"], chosen_model)
+    def apply(target: Settings) -> None:
+        target.active_provider = provider_id
+        target.set_model_for(provider_id, chosen_model)
         if base_url:
-            _write_env(provider["base_url"], base_url)
-        if api_key and provider.get("env_key"):
-            _write_env(provider["env_key"], api_key)
+            target.openai_compat_base_url = base_url
+        if api_key:
+            target.set_api_key(provider_id, api_key)
+
+    if save:
+        _write_env("ACTIVE_PROVIDER", provider_id)
+        if spec["model_env"]:
+            _write_env(spec["model_env"], chosen_model)
+        if base_url:
+            _write_env("OPENAI_COMPAT_BASE_URL", base_url)
+        if api_key and spec["key_env"]:
+            _write_env(spec["key_env"], api_key)
         console.print(
-            f"\n  [green]✓[/green]  Saved to [bold].env[/bold] — "
+            "\n  [green]✓[/green]  Saved to [bold].env[/bold] — "
             "you won't need to do this again.\n"
         )
     else:
         # Set in-process env so this run still works
-        os.environ["ACTIVE_PROVIDER"] = provider["key"]
-        settings.active_provider = provider["key"]
-        os.environ[provider["setting"]] = chosen_model
+        apply(settings)
+        os.environ["ACTIVE_PROVIDER"] = provider_id
+        if spec["model_env"]:
+            os.environ[spec["model_env"]] = chosen_model
         if base_url:
-            os.environ[provider["base_url"]] = base_url
-        if api_key and provider.get("env_key"):
-            os.environ[provider["env_key"]] = api_key
+            os.environ["OPENAI_COMPAT_BASE_URL"] = base_url
+        if api_key and spec["key_env"]:
+            os.environ[spec["key_env"]] = api_key
 
-    # Reload settings so the new values take effect, including this selection
-    # when the wizard was run against an existing in-memory Settings instance.
+    # Reload so new .env values take effect, then re-apply this selection on top.
     try:
         configured = Settings(_env_file=str(_ENV_PATH))  # type: ignore[call-arg]
     except Exception:
         configured = Settings()
-    configured.active_provider = provider["key"]
-    if provider["setting"] == "PREFERRED_CLOUD_MODEL":
-        configured.preferred_cloud_model = chosen_model
-    elif provider["setting"] == "PREFERRED_LOCAL_MODEL":
-        configured.preferred_local_model = chosen_model
-    elif provider["setting"] == "GITHUB_COPILOT_MODEL":
-        configured.github_copilot_model = chosen_model
-    elif provider["setting"] == "OPENAI_CODEX_MODEL":
-        configured.openai_codex_model = chosen_model
-    if base_url:
-        configured.openai_compat_base_url = base_url
-    if api_key and provider.get("env_key") == "OPENAI_COMPAT_API_KEY":
-        configured.openai_compat_api_key = api_key
+    apply(configured)
     return configured
 
 
