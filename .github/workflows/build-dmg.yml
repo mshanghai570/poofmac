@@ -1,9 +1,25 @@
 name: Build macOS DMG
 
 on:
+  # Every source change on main produces DMGs, so a fix can be tried in the
+  # packaged app straight away instead of waiting for someone to remember to
+  # dispatch a build. Docs-only and workflow-irrelevant changes are skipped;
+  # path filters are not evaluated for tag pushes, so releases still build.
   push:
+    branches: [main]
+    paths:
+      - "mac_cleaner/**"
+      - "pyproject.toml"
+      - "assets/**"
+      - ".github/workflows/build-dmg.yml"
     tags: ["v*"]
   workflow_dispatch:
+
+# A newer push supersedes an in-flight build of the same ref: two pushes in a
+# row should not leave four macOS runners duplicating each other's work.
+concurrency:
+  group: build-dmg-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # Intel runner — broadest compatibility with macOS 12/13 target.
