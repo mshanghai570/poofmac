@@ -2,54 +2,63 @@ name: Handle Release Packaging
 
 on:
   workflow_run:
-    workflows: ["Build DMG Application"] # 👈 Replace with the exact 'name:' from the top of your build file
+    workflows: ["Build macOS DMG"] # Matches your build file name exactly
     types:
       - completed
 
 permissions:
-  contents: write 
+  contents: write # Grants write access to create the release pages
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Only executes if the build workflow finished successfully
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # Step 1: Download the Intel Zip Artifact
-      - name: Download Intel Zip
+      # 1. Download Intel Zip File
+      - name: Download Intel Zip Artifact
         uses: actions/download-artifact@v4
         with:
-          name: PoofMac-main-macOS-Intel.zip # 👈 Replace with the exact upload name of your Intel artifact
-          path: ./compressed_assets
+          name: PoofMac-main-macOS-Intel.zip
+          path: ./compressed_assets/intel
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Step 2: Download the Apple Silicon Zip Artifact
-      - name: Download Apple Silicon Zip
+      # 2. Download Apple Silicon Zip File
+      - name: Download Apple Silicon Zip Artifact
         uses: actions/download-artifact@v4
         with:
-          name: PoofMac-main-macOS-AppleSilicon.zip # 👈 Replace with the exact upload name of your Apple Silicon artifact
-          path: ./compressed_assets
+          name: PoofMac-main-macOS-AppleSilicon.zip
+          path: ./compressed_assets/silicon
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Step 3: Extract the DMGs out of the Zip archives
+      # 3. Extract the archives to retrieve the hidden .dmg installers
       - name: Unzip Artifacts
         run: |
-          mkdir ./extracted_dmgs
-          unzip "./compressed_assets/**/*.zip" -d ./extracted_dmgs/
+          mkdir -p ./extracted_dmgs
+          # Find and unzip all zipped archives cleanly into our target directory
+          find ./compressed_assets -name "*.zip" -exec unzip -j {} -d ./extracted_dmgs/ \;
+          
+          # Debug checklist: Print the extracted assets to ensure files match
+          echo "=== Extracted Assets ==="
+          ls -la ./extracted_dmgs/
 
-      # Step 4: Create the release and upload the extracted DMGs
+      # 4. Generate the GitHub Release and upload both DMGs simultaneously
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Generates a clean version tag based on the automation run number
           TAG="v1.0.${{ github.event.workflow_run.run_number }}"
           
-          # This grabs every extracted .dmg from your folder and attaches it to the release
-          gh release create "$TAG" ./extracted_dmgs/**/*.dmg \
+          echo "Publishing Release $TAG with installers..."
+          
+          # Creates the release web page and attaches all extracted .dmg files
+          gh release create "$TAG" ./extracted_dmgs/*.dmg \
             --title "Release $TAG" \
             --generate-notes
