@@ -1,0 +1,55 @@
+name: Handle Release Packaging
+
+on:
+  workflow_run:
+    workflows: ["Build DMG Application"] # 👈 Replace with the exact 'name:' from the top of your build file
+    types:
+      - completed
+
+permissions:
+  contents: write 
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # Step 1: Download the Intel Zip Artifact
+      - name: Download Intel Zip
+        uses: actions/download-artifact@v4
+        with:
+          name: PoofMac-main-macOS-Intel.zip # 👈 Replace with the exact upload name of your Intel artifact
+          path: ./compressed_assets
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 2: Download the Apple Silicon Zip Artifact
+      - name: Download Apple Silicon Zip
+        uses: actions/download-artifact@v4
+        with:
+          name: PoofMac-main-macOS-AppleSilicon.zip # 👈 Replace with the exact upload name of your Apple Silicon artifact
+          path: ./compressed_assets
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Step 3: Extract the DMGs out of the Zip archives
+      - name: Unzip Artifacts
+        run: |
+          mkdir ./extracted_dmgs
+          unzip "./compressed_assets/**/*.zip" -d ./extracted_dmgs/
+
+      # Step 4: Create the release and upload the extracted DMGs
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.event.workflow_run.run_number }}"
+          
+          # This grabs every extracted .dmg from your folder and attaches it to the release
+          gh release create "$TAG" ./extracted_dmgs/**/*.dmg \
+            --title "Release $TAG" \
+            --generate-notes
