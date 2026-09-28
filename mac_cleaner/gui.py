@@ -89,7 +89,7 @@ from mac_cleaner.config import (
     provider_label,
 )
 from mac_cleaner.executor import Executor
-from mac_cleaner.llm import CleanerAgent
+from mac_cleaner.llm import CleanerAgent, explain_provider_error
 from mac_cleaner.scanner import format_size, get_disk_usage
 
 # ── Category visual metadata ──────────────────────────────────────────────────
@@ -678,6 +678,76 @@ class OpenAICompatModelsWorker(QThread):
         self.models_ready.emit(models, error)
 
 
+# Background threads must outlive the dialog that started them: the settings
+# window can be closed while a sign-in or a test request is still in flight,
+# and collecting a running QThread aborts the process.
+_inflight_workers: list[QThread] = []
+
+
+def _keep_alive(worker: QThread) -> None:
+    """Park a background thread until it finishes."""
+    if worker in _inflight_workers:
+        return
+    _inflight_workers.append(worker)
+
+    def _drop() -> None:
+        if worker in _inflight_workers:
+            _inflight_workers.remove(worker)
+
+    worker.finished.connect(_drop)
+
+
+class EndpointTestWorker(QThread):
+    """Send one tiny real request, so an endpoint's verdict is not a guess.
+
+    Fetch models only proves that a listing answered. This proves the endpoint
+    will serve the chosen model with the chosen key — the difference between
+    "looks configured" and "works".
+    """
+
+    result = Signal(bool, str)
+
+    def __init__(
+        self, base_url: str, api_key: str, model: str, label: str
+    ) -> None:
+        super().__init__()
+        self.base_url = base_url
+        self.api_key = api_key
+        self.model = model
+        self.label = label
+
+    def run(self) -> None:
+        import time
+
+        import litellm
+
+        started = time.monotonic()
+        try:
+            litellm.completion(
+                model=f"openai/{self.model}",
+                messages=[{"role": "user", "content": "Reply with the single word: ok"}],
+                api_base=self.base_url,
+                api_key=self.api_key or "not-needed",
+                max_tokens=5,
+                temperature=0,
+                timeout=20,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.result.emit(
+                False,
+                explain_provider_error(
+                    exc, model=self.model, display=self.label, is_custom_endpoint=True
+                ),
+            )
+            return
+        elapsed = time.monotonic() - started
+        self.result.emit(
+            True,
+            f"✓ {self.label} answered in {elapsed:.1f}s — this endpoint works. "
+            "Requests will be sent here.",
+        )
+
+
 class ExecutionWorker(QThread):
     """Runs file deletions in a background thread."""
 
@@ -952,6 +1022,8 @@ class SettingsDialog(QDialog):
         self._endpoint_base_edit: Optional[QLineEdit] = None
         self._endpoint_status: Optional[QLabel] = None
         self._endpoint_remove_btn: Optional[QPushButton] = None
+        self._test_btn: Optional[QPushButton] = None
+        self._test_worker: Optional[EndpointTestWorker] = None
         self._current_endpoint_id = ""
         self._endpoint_note = ""
 
@@ -1167,17 +1239,27 @@ class SettingsDialog(QDialog):
         fetch_btn.setToolTip("Ask this endpoint which models it hosts")
         fetch_btn.clicked.connect(self._fetch_compat_models)
         model_row.addWidget(fetch_btn)
-
-        save_btn = _btn("Save endpoint", "primary")
-        save_btn.setToolTip("Keep these details for reuse")
-        save_btn.clicked.connect(self._save_endpoint_clicked)
-        model_row.addWidget(save_btn)
         form.addRow("Model", model_row)
         layout.addLayout(form)
 
         self._endpoint_status = QLabel()
         self._endpoint_status.setWordWrap(True)
         layout.addWidget(self._endpoint_status)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        self._test_btn = _btn("Test connection", "secondary")
+        self._test_btn.setToolTip(
+            "Send one small real request — proves the URL, key and model work"
+        )
+        self._test_btn.clicked.connect(self._test_endpoint)
+        action_row.addWidget(self._test_btn)
+
+        save_btn = _btn("Save endpoint", "primary")
+        save_btn.setToolTip("Keep these details for reuse")
+        save_btn.clicked.connect(self._save_endpoint_clicked)
+        action_row.addWidget(save_btn)
+        layout.addLayout(action_row)
 
         # Live feedback: the status line reacts as fields are typed, so the page
         # is never silently wrong about what will be used.
@@ -1488,6 +1570,36 @@ class SettingsDialog(QDialog):
         self._refresh_endpoint_status()
         self._refresh_provider_status()
 
+    def _test_endpoint(self) -> None:
+        """Ask the endpoint to serve the selected model, once."""
+        draft = self._endpoint_from_widgets()
+        ok, message = Settings.endpoint_status(draft)
+        if not ok:
+            self._endpoint_status.setText(f"⚠ {message} — fill that in before testing.")
+            return
+        if self._test_worker is not None and self._test_worker.isRunning():
+            return
+        label = draft["name"] or store.host_label(draft["base_url"])
+        self._endpoint_note = ""
+        self._endpoint_status.setText(
+            f"Testing {label} — sending one small request to “{draft['model']}”…"
+        )
+        if self._test_btn is not None:
+            self._test_btn.setEnabled(False)
+        worker = EndpointTestWorker(
+            draft["base_url"], draft["api_key"], draft["model"], f"{draft['model']} ({label})"
+        )
+        self._test_worker = worker
+        _keep_alive(worker)
+        worker.result.connect(self._on_test_finished)
+        worker.start()
+
+    def _on_test_finished(self, ok: bool, message: str) -> None:
+        if self._test_btn is not None:
+            self._test_btn.setEnabled(True)
+        self._endpoint_note = message
+        self._refresh_endpoint_status()
+
     # ── CLI sign-in ────────────────────────────────────────────────────────────
 
     def _start_signin(self, provider_id: str) -> None:
@@ -1505,6 +1617,7 @@ class SettingsDialog(QDialog):
         widgets["button"].setEnabled(False)
         output.setPlainText(f"Running {executable} login — follow the instructions below.")
         self._signin_worker = SignInWorker([executable, "login"])
+        _keep_alive(self._signin_worker)
         self._signin_worker.output.connect(output.append)
         self._signin_worker.completed.connect(
             lambda ok, p=provider_id: self._on_signin_finished(p, ok)

@@ -298,7 +298,16 @@ def discover_models(
     # Most gateways serve /v1/models; some serve /models. Try both before
     # giving up, so either form of base URL works as typed.
     urls = [f"{base}/models"]
-    if not base.endswith("/v1"):
+    if base.endswith("/v1"):
+        # ...and some put the catalogue beside the OpenAI root rather than
+        # under it: a Base URL of ".../api/gateway/v1" lists models at
+        # ".../api/gateway/models". Gateways name that path in their own
+        # 404s, so a user following the endpoint's advice is not left stuck
+        # with an empty model list.
+        parent = base[: -len("/v1")].rstrip("/")
+        if parent:
+            urls.append(f"{parent}/models")
+    else:
         urls.append(f"{base}/v1/models")
 
     last_error = ""
@@ -326,7 +335,7 @@ def discover_models(
             if models:
                 return models, ""
             last_error = f"{url} returned no model ids"
-    return [], last_error
+    return [], f"{last_error} — tried {len(urls)} paths from {base}"
 
 
 class Settings(BaseSettings):

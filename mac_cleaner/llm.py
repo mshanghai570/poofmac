@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import re
 import time
 from collections.abc import Generator
 from typing import Optional
@@ -51,17 +52,12 @@ def _strip_provider_prefix(model: str) -> str:
     return model
 
 
-# LiteLLM wraps a provider's error body in its own exception text; these are the
-# wrappers worth peeling off before showing the message to a user.
-_ERROR_WRAPPERS = (
-    "litellm.NotFoundError:",
-    "litellm.BadRequestError:",
-    "litellm.AuthenticationError:",
-    "OpenAIException -",
-    "NotFoundError:",
-    "BadRequestError:",
-    "AuthenticationError:",
-)
+# LiteLLM wraps a provider's error body in its own exception text, and it has
+# an exception class per provider and status — so list them and one will always
+# be missing (litellm.APIError was, and its name leaked into the chat). Peel
+# wrappers off by shape instead: "litellm.APIError: APIError: OpenAIException -
+# <the endpoint's sentence>".
+_ERROR_WRAPPER_RE = re.compile(r"^(?:litellm\.)?[A-Za-z_]*(?:Error|Exception)\s*[:\-]\s*")
 
 
 def _endpoint_quote(raw: object) -> str:
@@ -74,12 +70,10 @@ def _endpoint_quote(raw: object) -> str:
     """
     text = " ".join(str(raw or "").split())
     while True:
-        for wrapper in _ERROR_WRAPPERS:
-            if text.startswith(wrapper):
-                text = text[len(wrapper):].lstrip()
-                break
-        else:
+        stripped = _ERROR_WRAPPER_RE.sub("", text, count=1)
+        if stripped == text:
             break
+        text = stripped.lstrip()
 
     if "{" in text and "}" in text:
         body = text[text.find("{"): text.rfind("}") + 1]
@@ -103,6 +97,118 @@ def _endpoint_quote(raw: object) -> str:
     if len(text) > 240:
         text = text[:237].rstrip() + "…"
     return text
+
+
+# LiteLLM raises a class per HTTP status, but the useful part is always the
+# same: the endpoint's own sentence. These markers read guidance out of it, so
+# even an unfamiliar status reads as English instead of "Unexpected error".
+_MODEL_MISSING = (
+    "does not exist",
+    "model_not_found",
+    "no such model",
+    "unknown model",
+    "invalid model",
+    "model not found",
+)
+_CLIENT_REFUSED = (
+    "only be used from within",
+    "only available within",
+    "must be used from",
+    "only works from",
+    "unauthorized client",
+    "client is not allowed",
+    "not allowed to use",
+    "third-party client",
+)
+_AUTH_MARKERS = (
+    "invalid api key",
+    "incorrect api key",
+    "invalid_api_key",
+    "unauthorized",
+    "authentication",
+    "api key not valid",
+    "no api key",
+)
+_CONNECTION_MARKERS = (
+    "connection",
+    "unreachable",
+    "timed out",
+    "timeout",
+    "refused",
+    "no such host",
+    "certificate",
+    "name or service not known",
+)
+
+
+def explain_provider_error(
+    exc: object,
+    *,
+    model: str,
+    display: str,
+    is_custom_endpoint: bool,
+) -> str:
+    """Readable, actionable text for a failed provider request.
+
+    One place decides what a provider failure means, so the chat and the
+    settings page's Test connection button can never tell different stories.
+    """
+    quoted = _endpoint_quote(exc)
+    lowered = quoted.lower()
+    model_id = _strip_provider_prefix(model)
+
+    auth_advice = (
+        "Check the API key in Settings (⚙) → Custom endpoints. Leave it blank for a\n"
+        "local server that needs none."
+        if is_custom_endpoint
+        else "Check the API key in Settings (⚙) — each cloud provider has its own\n"
+        "page there."
+    )
+
+    if any(marker in lowered for marker in _MODEL_MISSING):
+        lines = [f'The endpoint does not host "{model_id}" — {display}.']
+        if is_custom_endpoint:
+            lines.append(
+                "Model ids must match the endpoint exactly — an extra vendor prefix\n"
+                "or a \":free\"-style suffix is enough for the gateway to reject it.\n"
+                "Open Settings (⚙) → Custom endpoints, press Fetch models, and pick\n"
+                "an id from the list."
+            )
+        else:
+            lines.append(
+                "Pick the model again in Settings (⚙) — the provider does not offer\n"
+                "the id that is currently selected."
+            )
+    elif any(marker in lowered for marker in _CLIENT_REFUSED):
+        lines = [
+            f"The endpoint refused the request — {display}.",
+            "Services sometimes gate a free tier to their own app or command line.\n"
+            "PoofMac cannot pass that check from the outside, and no setting here\n"
+            "changes it: use an endpoint or API key that accepts external clients,\n"
+            "or switch provider — GitHub Copilot or OpenAI Codex in Settings (⚙).",
+        ]
+    elif isinstance(exc, litellm.AuthenticationError) or any(
+        marker in lowered for marker in _AUTH_MARKERS
+    ):
+        lines = [f"The endpoint rejected the credentials — {display}.", auth_advice]
+    elif isinstance(exc, litellm.APIConnectionError) or any(
+        marker in lowered for marker in _CONNECTION_MARKERS
+    ):
+        lines = [
+            f"Could not reach the endpoint — {display}.",
+            "Check that the server is running and that the Base URL is right, in\n"
+            "Settings (⚙) → Custom endpoints.",
+        ]
+    else:
+        lines = [
+            f"The endpoint refused the request — {display}.",
+            "Settings (⚙) → Custom endpoints shows the Base URL, key and model that\n"
+            "were sent; Test connection reports which part is rejected.",
+        ]
+
+    if quoted:
+        lines += ["", f"Endpoint said: {quoted}"]
+    return "\n".join(lines)
 
 # ── Text-based tool call parser ───────────────────────────────────────────────
 
@@ -236,32 +342,16 @@ class CleanerAgent:
         self.cleanup_plan: Optional[dict] = None
         self._sig = _origin_sig()
 
-    def _not_found_help(self, raw: str) -> str:
-        """Explain a rejected model id in terms the user can act on.
-
-        A gateway answers ``404 model_not_found`` with a wall of JSON, which
-        reads like a crash. What actually happened is that the id we sent is
-        not in the endpoint's catalogue — usually a stray vendor prefix or a
-        ":free"-style suffix — so say that, and say where to fix it.
-        """
-        model_id = _strip_provider_prefix(self.model)
-        if self.settings.endpoint_for(self.settings.get_active_provider()):
-            advice = (
-                "Model ids must match the endpoint exactly — an extra vendor prefix\n"
-                "or a \":free\"-style suffix is enough for the gateway to reject it.\n"
-                "Open Settings (⚙) → Custom endpoints, press Fetch models, and pick\n"
-                "an id from the list."
-            )
-        else:
-            advice = (
-                "Pick the model again in Settings (⚙) — the provider does not offer\n"
-                "the id that is currently selected."
-            )
-        lines = [f'The endpoint does not host "{model_id}" — {self.model_display}.', advice]
-        quoted = _endpoint_quote(raw)
-        if quoted:
-            lines += ["", f"Endpoint said: {quoted}"]
-        return "\n".join(lines)
+    def _explain(self, exc: object) -> str:
+        """The message the user sees for any failed request from this agent."""
+        return explain_provider_error(
+            exc,
+            model=self.model,
+            display=self.model_display,
+            is_custom_endpoint=bool(
+                self.settings.endpoint_for(self.settings.get_active_provider())
+            ),
+        )
 
     def run(self, user_message: str) -> Generator[dict, None, None]:
         """
@@ -299,42 +389,25 @@ class CleanerAgent:
                     response = litellm.completion(**request_kwargs)
                     break  # success — exit retry loop
                 except litellm.RateLimitError as exc:
-                    yield {"type": "error", "text": f"Rate limit: {exc}. Wait a moment and retry."}
+                    yield {
+                        "type": "error",
+                        "text": f"Rate limit: {_endpoint_quote(exc)}. Wait a moment and retry.",
+                    }
                     return
                 except litellm.NotFoundError as exc:
-                    yield {"type": "error", "text": self._not_found_help(str(exc))}
+                    yield {"type": "error", "text": self._explain(exc)}
                     return
                 except litellm.AuthenticationError as exc:
-                    endpoint = self.settings.endpoint_for(self.settings.get_active_provider())
-                    if endpoint is not None:
-                        text = (
-                            f"The endpoint rejected the API key for "
-                            f"\"{endpoint.get('name') or 'Custom endpoint'}\".\n"
-                            "Check the key in Settings (⚙) → Custom endpoints. "
-                            "Leave it blank for a local server that needs none."
-                        )
-                    else:
-                        text = (
-                            "Authentication failed. Check the API key in "
-                            "Settings (⚙)\n"
-                            "Anthropic: https://console.anthropic.com\n"
-                            "OpenRouter: https://openrouter.ai\n"
-                            "OpenAI: https://platform.openai.com"
-                        )
-                    quoted = _endpoint_quote(exc)
-                    yield {"type": "error", "text": f"{text}\n\n{quoted}" if quoted else text}
+                    yield {"type": "error", "text": self._explain(exc)}
                     return
                 except litellm.BadRequestError as exc:
-                    text = str(exc)
-                    lowered = text.lower()
-                    if "model" in lowered and (
-                        "not found" in lowered
-                        or "does not exist" in lowered
-                        or "model_not_found" in lowered
-                    ):
-                        yield {"type": "error", "text": self._not_found_help(text)}
-                        return
-                    yield {"type": "error", "text": f"Bad request: {text}"}
+                    yield {"type": "error", "text": self._explain(exc)}
+                    return
+                except litellm.APIError as exc:
+                    # Every other status the provider can return — a refused
+                    # free tier, a proxy in the way, a 500 — used to fall
+                    # through to "Unexpected error: litellm.APIError: …".
+                    yield {"type": "error", "text": self._explain(exc)}
                     return
                 except litellm.APIConnectionError as exc:
                     # Ollama cloud returns "Server overloaded" transiently
@@ -349,7 +422,8 @@ class CleanerAgent:
                         yield {
                             "type": "error",
                             "text": (
-                                f"Server unavailable after 3 attempts: {exc}\n"
+                                f"Server unavailable after 3 attempts: "
+                                f"{_endpoint_quote(exc)}\n"
                                 "Ollama cloud may be under load. Try again in a minute."
                             ),
                         }

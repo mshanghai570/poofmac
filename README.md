@@ -195,7 +195,9 @@ server and a company gateway can coexist:
    the dropdown; the listing is saved, so the main window's model picker shows
    it without touching the network again. If the endpoint hides `/models`, the
    status line says why and you can type an id by hand.
-3. Press **Save endpoint**, pick a model, then **Save & Close**.
+3. Press **Test connection** — PoofMac sends one small real request and reports
+   whether that URL, key and model actually work — then **Save endpoint** and
+   **Save & Close**.
 
 The setup wizard offers the same flow on first run, and the endpoints are stored
 in `endpoints.json` next to `.env` (see [Configure your model](#configure-your-model)).
@@ -206,8 +208,14 @@ and imported into it.
 Model ids are sent to the endpoint exactly as written. Gateways are strict about
 this: `nex-agi/nex-n2.5-pro:free` and `nex-n2.5-pro:free` are different models, so
 copy the id from the endpoint's own model list — **Fetch models** is the reliable
-way to get it right. If a gateway answers `404 model_not_found`, the app now says
+way to get it right. If a gateway answers `404 model_not_found`, the app says
 which id it sent and points at that button instead of showing a raw traceback.
+
+Some services also gate a free tier to their own app or CLI. If an endpoint
+refuses PoofMac with something like "this free tier can only be used from within
+<product>", that is the service declining outside clients — no setting here
+changes it. Use an endpoint or API key that accepts external clients, or switch
+to a provider that does.
 
 ### Copilot and Codex
 
