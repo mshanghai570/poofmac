@@ -723,15 +723,24 @@ class EndpointTestWorker(QThread):
 
         started = time.monotonic()
         try:
-            litellm.completion(
-                model=f"openai/{self.model}",
-                messages=[{"role": "user", "content": "Reply with the single word: ok"}],
-                api_base=self.base_url,
-                api_key=self.api_key or "not-needed",
-                max_tokens=5,
-                temperature=0,
-                timeout=20,
-            )
+            # Mirror completion_kwargs(): a keyless endpoint must send NO
+            # Authorization header — Kilo 401s a placeholder Bearer token but
+            # accepts a missing header. LiteLLM refuses an empty api_key
+            # client-side, so the placeholder stays and extra_headers blanks
+            # the header at the HTTP layer.
+            key = (self.api_key or "").strip()
+            kwargs: dict = {
+                "model": f"openai/{self.model}",
+                "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
+                "api_base": self.base_url,
+                "api_key": key or "not-needed",
+                "max_tokens": 5,
+                "temperature": 0,
+                "timeout": 20,
+            }
+            if not key:
+                kwargs["extra_headers"] = {"Authorization": ""}
+            litellm.completion(**kwargs)
         except Exception as exc:  # noqa: BLE001
             self.result.emit(
                 False,

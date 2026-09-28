@@ -33,8 +33,16 @@ from typing import Optional
 
 import litellm
 
-from mac_cleaner.config import Settings
+from mac_cleaner.config import MODEL_REGISTRY, Settings
 from mac_cleaner.tools import TOOLS, execute_tool
+
+
+def _kilo_has_key() -> bool:
+    """Whether a Kilo API key is currently configured."""
+    try:
+        return bool(Settings().kilo_api_key.strip())
+    except Exception:  # noqa: BLE001 — advice must never crash the error path
+        return False
 
 litellm.set_verbose = False  # suppress noisy debug output
 
@@ -164,6 +172,15 @@ def explain_provider_error(
         else "Check the API key in Settings (⚙) — each cloud provider has its own\n"
         "page there."
     )
+    if display.endswith("(Kilo Gateway)") and not _kilo_has_key():
+        # Kilo's free ids need no key at all, so "check your API key" would
+        # send the user hunting for a setting that is meant to stay empty.
+        auth_advice = (
+            "Kilo's free models need no API key — leave the key field empty in\n"
+            "Settings (⚙). If a key is entered there, it is invalid: clear it and\n"
+            "retry. (Free tiers are shared, so a busy moment can also answer with\n"
+            "this error — trying again usually works.)"
+        )
 
     if any(marker in lowered for marker in _MODEL_MISSING):
         lines = [f'The endpoint does not host "{model_id}" — {display}.']
@@ -215,6 +232,10 @@ def explain_provider_error(
 _KNOWN_TOOLS = {
     "get_disk_overview", "run_full_disk_scan", "scan_category",
     "check_path_safety", "propose_cleanup_plan",
+    # Maintenance & optimization
+    "heavy_consumers", "hung_applications", "launch_agents",
+    "toggle_launch_agent", "memory_report", "tm_snapshots",
+    "thin_tm_snapshots", "purgeable_space", "get_maintenance_guide",
 }
 
 
@@ -284,33 +305,63 @@ def _extract_text_tool_calls(text: str) -> list[tuple[str, dict]]:
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-You are PoofMac, a disk-space analysis assistant for macOS.
+You are PoofMac, a Mac maintenance assistant for macOS.
 
 YOUR ROLE
 ─────────
-Help users reclaim disk space by analysing their Mac and producing a clear,
-safe cleanup plan. You explain everything in plain developer-friendly language.
+You help with TWO kinds of requests:
 
-MANDATORY WORKFLOW — follow this EVERY time
-────────────────────────────────────────────
+1. DISK SPACE — analyse the Mac and produce a safe, clear cleanup plan.
+2. MAINTENANCE & PERFORMANCE — slow Mac, memory, boot time, background
+   services, hung apps, DNS or Spotlight trouble, Time Machine snapshots.
+
+You are a CONVERSATION partner, not a batch job. Chat naturally:
+• Answer questions directly and briefly. Small talk gets a small answer.
+• If a request is vague ("my Mac is slow"), ask ONE short clarifying question
+  ("Slow overall, or mainly at startup? Anything spinning in the Dock?")
+  or investigate first with the read-only tools, then report what you see.
+• You remember earlier turns in this conversation — build on them. Do not
+  re-scan if you already have the answer from a moment ago.
+• Give feedback as you go: after a tool result, say in one line what it
+  showed before deciding the next step.
+• End substantive answers with a short suggestion of what to do next
+  ("Want me to thin those snapshots?"), but never nag.
+
+DISK-SCAN WORKFLOW — only when the user wants disk space cleaned
+─────────────────────────────────────────────────────────────────
 1. Call get_disk_overview  →  understand current disk state.
 2. Call run_full_disk_scan →  find everything recoverable.
-3. Analyse results. For anything uncertain, call check_path_safety.
+3. For anything uncertain, call check_path_safety.
 4. Call propose_cleanup_plan with ALL findings.
    - Include EVERY category found, even small ones.
    - Set risk_level accurately: SAFE / CAUTION / SKIP.
    - Write a clear "reason" for each item explaining what it is.
 
+MAINTENANCE TOOLS
+─────────────────
+• heavy_consumers — what is using CPU/RAM right now.
+• hung_applications — apps not responding.
+• launch_agents / toggle_launch_agent — what runs at login; you may disable
+  a USER agent, but always tell the user which one and why, and get their OK.
+• memory_report — RAM pressure, purgeable memory, swap.
+• tm_snapshots / thin_tm_snapshots — local snapshots eat disk; you may thin
+  them after the user agrees.
+• purgeable_space — what macOS could drop on demand.
+• get_maintenance_guide — recipes for flush_dns_cache, reindex_spotlight,
+  speed_up_boot, speed_up_mail, repair_disk_permissions.
+
 ABSOLUTE RULES — never break these
-────────────────────────────────────
-• You ONLY call the provided tools. You do NOT run shell commands or suggest
-  the user run dangerous commands.
+──────────────────────────────────
+• You ONLY call the provided tools. You NEVER run shell commands yourself.
+• Maintenance steps that need admin rights (sudo): NEVER run them, never
+  ask the user to paste blind commands. Use get_maintenance_guide, explain
+  what each command does in one line, and let the user run it in Terminal.
 • NEVER propose deleting: /System, /usr, /bin, /etc, /Library (system),
   /Applications, ~/.ssh, ~/.aws, Keychain, Documents, Photos, Mail, Music,
   Movies, Desktop, Contacts, or any path you are not certain is a cache/temp.
 • Set risk_level = SKIP for anything you are not confident is safe.
 • Be honest. If you find very little to clean, say so.
-• keep "reason" fields concise (1-2 sentences). Developers don't need essays.
+• Keep answers tight. Developers don't need essays.
 
 RISK LEVELS
 ───────────

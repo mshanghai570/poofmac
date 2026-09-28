@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 
+from mac_cleaner import maintenance
 from mac_cleaner.safety import validate_path
 from mac_cleaner.scanner import (
     get_disk_usage,
@@ -100,6 +101,136 @@ TOOLS: list[dict] = [
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    # ── Maintenance & optimization (beyond disk cleanup) ────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "heavy_consumers",
+            "description": (
+                "List the top processes by CPU and by RAM right now. Read-only. "
+                "Use when the user asks what is slowing the Mac down or eating battery."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "How many per list (default 10)."}
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hung_applications",
+            "description": (
+                "List applications that are not responding (hung). Read-only. "
+                "Pair with advice from the tool result on force-quitting them."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "launch_agents",
+            "description": (
+                "List user and system LaunchAgents (background services that run at "
+                "login) with their enabled state. Read-only. For 'speed up my boot'."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "toggle_launch_agent",
+            "description": (
+                "Enable or disable a USER LaunchAgent (one from ~/Library/LaunchAgents) "
+                "by renaming its plist. Reversible — call launch_agents first to see the "
+                "labels. System-scope agents cannot be toggled; give the user the "
+                "Terminal command instead. Ask the user to confirm before disabling."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Agent label, i.e. the plist filename without .plist."},
+                    "enable": {"type": "boolean", "description": "true to enable, false to disable."},
+                },
+                "required": ["label", "enable"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_report",
+            "description": (
+                "Report RAM usage, memory pressure, purgeable memory and swap. "
+                "Read-only. Use for 'memory optimization' or 'free RAM' questions."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tm_snapshots",
+            "description": (
+                "List local Time Machine snapshots, which can hold GBs of purgeable "
+                "disk space. Read-only. Call before thinning them."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "thin_tm_snapshots",
+            "description": (
+                "Ask Time Machine to thin (delete) local snapshots older than the given "
+                "age, reclaiming disk space. Time Machine decides what is safe. "
+                "Ask the user to confirm first; call tm_snapshots beforehand."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keep_hours": {
+                        "type": "integer",
+                        "description": "Keep snapshots newer than this many hours (default 24).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "purgeable_space",
+            "description": "Report the disk's purgeable space. Read-only.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_maintenance_guide",
+            "description": (
+                "Get a ready-to-copy Terminal recipe for maintenance that needs admin "
+                "rights (flush_dns_cache, reindex_spotlight, speed_up_boot, "
+                "speed_up_mail, repair_disk_permissions). PoofMac never runs sudo "
+                "itself — present the commands, explain them, and let the user run them."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Guide name, e.g. flush_dns_cache."}
+                },
+                "required": ["name"],
             },
         },
     },
@@ -221,6 +352,39 @@ def execute_tool(name: str, args: dict) -> str:
                 "risk_level": verdict.risk_level,
             }
         )
+
+    if name == "heavy_consumers":
+        return json.dumps(maintenance.heavy_consumers(limit=int(args.get("limit", 10) or 10)))
+
+    if name == "hung_applications":
+        return json.dumps(maintenance.hung_applications())
+
+    if name == "launch_agents":
+        return json.dumps(maintenance.launch_agents())
+
+    if name == "toggle_launch_agent":
+        return json.dumps(
+            maintenance.toggle_launch_agent(
+                str(args.get("label", "")), bool(args.get("enable", False))
+            )
+        )
+
+    if name == "memory_report":
+        return json.dumps(maintenance.memory_report())
+
+    if name == "tm_snapshots":
+        return json.dumps(maintenance.tm_snapshots())
+
+    if name == "thin_tm_snapshots":
+        return json.dumps(
+            maintenance.thin_tm_snapshots(keep_hours=int(args.get("keep_hours", 24) or 24))
+        )
+
+    if name == "purgeable_space":
+        return json.dumps(maintenance.purgeable_space())
+
+    if name == "get_maintenance_guide":
+        return json.dumps(maintenance.get_maintenance_guide(str(args.get("name", ""))))
 
     if name == "propose_cleanup_plan":
         # The TUI intercepts and renders this; we just echo it back so the

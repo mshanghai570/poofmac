@@ -335,13 +335,13 @@ def discover_models(
 
     last_error = ""
     for url in urls:
-        request = Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {(api_key or '').strip() or 'not-needed'}",
-                "Accept": "application/json",
-            },
-        )
+        # A keyless gateway must receive NO Authorization header at all: Kilo
+        # answers 401 to "Bearer not-needed" but 200 to a missing header, and
+        # other gateways behave the same. Only send one when a key exists.
+        headers = {"Accept": "application/json"}
+        if (api_key or "").strip():
+            headers["Authorization"] = f"Bearer {api_key.strip()}"
+        request = Request(url, headers=headers)
         try:
             with urlopen(request, timeout=timeout) as response:
                 payload = json.loads(response.read().decode("utf-8", "replace"))
@@ -552,18 +552,41 @@ class Settings(BaseSettings):
         self.set_model_for(self.get_active_provider(), model)
 
     def completion_kwargs(self) -> dict:
-        """api_base/api_key for a custom endpoint; empty for every other provider."""
+        """api_base/api_key for a custom endpoint; empty for every other provider.
+
+        For a keyless endpoint (Kilo free ids, bare local servers) the dict
+        carries ``extra_headers`` that blank the Authorization header: the
+        OpenAI SDK always sends one, and Kilo rejects its "not-needed"
+        placeholder with 401 while accepting a missing header with 200.
+        """
         if self.get_active_provider() == "kilo":
+            key = self.kilo_api_key.strip()
+            if key:
+                return {
+                    "api_base": "https://api.kilo.ai/api/gateway",
+                    "api_key": key,
+                }
             return {
                 "api_base": "https://api.kilo.ai/api/gateway",
-                "api_key": self.kilo_api_key.strip() or "not-needed",
+                # LiteLLM refuses an empty api_key client-side ("Missing
+                # credentials"), so a placeholder still travels — but the
+                # blanked header wins at the HTTP layer.
+                "api_key": "not-needed",
+                "extra_headers": {"Authorization": ""},
             }
         endpoint = self.endpoint_for(self.get_active_provider())
         if endpoint is None:
             return {}
+        key = str(endpoint.get("api_key", "")).strip()
+        if key:
+            return {
+                "api_base": str(endpoint.get("base_url", "")).strip().rstrip("/"),
+                "api_key": key,
+            }
         return {
             "api_base": str(endpoint.get("base_url", "")).strip().rstrip("/"),
-            "api_key": str(endpoint.get("api_key", "")).strip() or "not-needed",
+            "api_key": "not-needed",
+            "extra_headers": {"Authorization": ""},
         }
 
     def get_active_model(self) -> tuple[str, str]:
