@@ -211,6 +211,30 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_large_files",
+            "description": (
+                "Find the largest files in the user's home directory (outside "
+                "Library/caches), biggest first — installers, videos, archives, VM "
+                "images. Read-only; nothing is removed. Suggest the GUI's Large "
+                "Files tab for trashing, or check_path_safety + the cleanup plan "
+                "for specific paths."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "min_size_mb": {
+                        "type": "integer",
+                        "description": "Minimum file size in MB (default 100).",
+                    },
+                    "limit": {"type": "integer", "description": "Max files to return (default 30)."},
+                },
+                "required": [],
+            },
+        },
+    },
     # ── App Uninstaller ──────────────────────────────────────────────────
     {
         "type": "function",
@@ -511,6 +535,14 @@ def execute_tool(name: str, args: dict) -> str:
     if name == "app_acceleration":
         return json.dumps(
             maintenance.app_acceleration(vacuum_mail=bool(args.get("vacuum_mail", False)))
+        )
+
+    if name == "find_large_files":
+        return json.dumps(
+            maintenance.find_large_files(
+                min_size_mb=int(args.get("min_size_mb", 100) or 100),
+                limit=int(args.get("limit", 30) or 30),
+            )
         )
 
     if name == "list_installed_apps":

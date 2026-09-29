@@ -183,16 +183,29 @@ def hung_applications() -> dict:
                 }
             )
 
+    apps = _foreground_apps()
+    # One batched ps for every pid: a separate ps per app measured ~0.4s each
+    # (≈20s for 49 apps — enough to make the dialog feel hung). "pid=,state="
+    # gives parseable "123 S" lines in one shot.
+    pids = ",".join(str(a["pid"]) for a in apps)
+    states: dict[int, str] = {}
+    if pids:
+        ok, out = _run(["ps", "-o", "pid=,state=", "-p", pids], timeout=10.0)
+        if ok:
+            for line in out.splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) == 2 and parts[0].isdigit():
+                    states[int(parts[0])] = parts[1].strip()
+
     suspected: list[dict] = []
-    for app in _foreground_apps():
-        ok, state = _run(["ps", "-o", "state=", "-p", str(app["pid"])], timeout=5.0)
-        s = state.strip()
+    for app in apps:
+        s = states.get(app["pid"], "")
         # "U" = uninterruptible wait: the classic stuck-in-a-syscall signature.
-        if ok and "U" in s:
+        if "U" in s:
             suspected.append({**app, "state": s})
 
     return {
-        "gui_apps": _foreground_apps(),
+        "gui_apps": apps,
         "suspected_hung": suspected,
         "hang_reports": hang_reports,
         "count": len(suspected),
@@ -784,6 +797,85 @@ def uninstall_app(app_path: str, remove_preferences: bool = True) -> dict:
         "kept_preferences": not remove_preferences,
         "freed_human": _human(freed),
         "note": "Everything is in the Trash — recoverable until it is emptied.",
+    }
+
+
+# ── Large File Finder — the disk scanner's complement for individual files ──────
+
+# Trees excluded from the large-file walk: Library is the disk cleaner's turf
+# (already scanned by run_full_disk_scan), caches and package registries are
+# auto-recreatable, and .git/.build objects are noise, not user files.
+_LF_SKIP_TOP = {".Trash", "Library"}
+_LF_SKIP_NAME = {
+    "node_modules", ".venv", "venv", "__pycache__", ".git",
+    "Library", "Pods", ".build", ".gradle", ".cargo",
+    "DerivedData", ".Trash",
+}
+_LF_TIME_BUDGET = 55.0  # seconds; the walk yields partial results at the cap
+
+
+def find_large_files(min_size_mb: int = 100, limit: int = 30) -> dict:
+    """The largest user files outside Library/caches, biggest first.
+
+    Walks the home directory pruning package registries and build trees, so
+    what remains is what the user (or their tools) actually put there: disk
+    images, videos, archives, installers, VM images, build artifacts they
+    exported. A time budget returns partial results on huge homes — flagged
+    in the output so the caller can say so.
+    """
+    home = Path.home()
+    threshold = max(1, min_size_mb) * 1024 * 1024
+    found: list[dict] = []
+    scanned = 0
+    started = time.monotonic()
+    timed_out = False
+
+    for root, dirs, files in os.walk(home, topdown=True, onerror=lambda e: None):
+        rel = os.path.relpath(root, home)
+        top = rel.split(os.sep)[0] if rel != "." else ""
+        if top in _LF_SKIP_TOP:
+            dirs[:] = []
+            continue
+        dirs[:] = [d for d in dirs if d not in _LF_SKIP_NAME]
+        for name in files:
+            scanned += 1
+            try:
+                full = os.path.join(root, name)
+                st = os.stat(full)
+                if st.st_size >= threshold and not os.path.islink(full):
+                    found.append(
+                        {
+                            "path": full,
+                            "size_bytes": st.st_size,
+                            "size_human": _human(st.st_size),
+                            "modified": time.strftime(
+                                "%Y-%m-%d", time.localtime(st.st_mtime)
+                            ),
+                        }
+                    )
+            except OSError:
+                continue
+        if time.monotonic() - started > _LF_TIME_BUDGET:
+            timed_out = True
+            break
+
+    found.sort(key=lambda f: f["size_bytes"], reverse=True)
+    total = sum(f["size_bytes"] for f in found[:limit])
+    return {
+        "files": found[:limit],
+        "shown": min(len(found), limit),
+        "matched_total": len(found),
+        "files_scanned": scanned,
+        "min_size_mb": min_size_mb,
+        "partial_scan": timed_out,
+        "elapsed_seconds": round(time.monotonic() - started, 1),
+        "top_total_human": _human(total),
+        "note": (
+            "Caches and Library trees are excluded — those belong to the disk "
+            "scanner. These are files in the open: installers, videos, archives, "
+            "VM images. Trash them (GUI) or delete explicitly; nothing here is "
+            "removed by this scan."
+        ),
     }
 
 

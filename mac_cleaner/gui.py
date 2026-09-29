@@ -35,6 +35,7 @@ import html
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -1800,6 +1801,7 @@ class MaintenanceWorker(QThread):
             "list_apps": maintenance.list_installed_apps,
             "residuals": maintenance.find_app_residuals,
             "uninstall": maintenance.uninstall_app,
+            "large_files": maintenance.find_large_files,
         }.get(self.action)
         if fn is None:
             self.action_done.emit(self.action, False, f"Unknown action: {self.action!r}")
@@ -1832,6 +1834,7 @@ class MaintenanceDialog(QDialog):
 
         tabs.addTab(self._build_maintenance_tab(), "Maintenance")
         tabs.addTab(self._build_uninstaller_tab(), "App Uninstaller")
+        tabs.addTab(self._build_large_files_tab(), "Large Files")
 
         self._refresh_apps()
 
@@ -2073,6 +2076,161 @@ class MaintenanceDialog(QDialog):
             f'{scan.get("total_human", "0 B")} — nothing removed yet.'
         )
 
+    # ── Tab 3: Large Files ────────────────────────────────────────────────
+
+    def _build_large_files_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 12, 4, 4)
+        layout.setSpacing(10)
+
+        controls = QHBoxLayout()
+        controls.addWidget(_section_label("Files larger than"))
+        from PySide6.QtWidgets import QSpinBox
+
+        self.lf_size_spin = QSpinBox()
+        self.lf_size_spin.setRange(1, 100_000)
+        self.lf_size_spin.setValue(100)
+        self.lf_size_spin.setSuffix(" MB")
+        self.lf_size_spin.setFixedWidth(110)
+        controls.addWidget(self.lf_size_spin)
+        self.lf_scan_btn = _btn("🔍  Scan", "secondary")
+        self.lf_scan_btn.setToolTip(
+            "Walk the home directory (skipping caches and build trees) for the "
+            "biggest files. Takes up to a minute on a full disk."
+        )
+        self.lf_scan_btn.clicked.connect(self._on_large_file_scan)
+        controls.addWidget(self.lf_scan_btn)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.lf_table = QTableWidget(0, 4)
+        self.lf_table.setHorizontalHeaderLabels(["", "File", "Modified", "Size"])
+        hh = self.lf_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.lf_table.setColumnWidth(0, 36)
+        self.lf_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.lf_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.lf_table.setAlternatingRowColors(True)
+        self.lf_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.lf_table, stretch=1)
+
+        lf_btn_row = QHBoxLayout()
+        self.lf_trash_btn = _btn("🗑  Trash Selected", "danger")
+        self.lf_trash_btn.setToolTip(
+            "Move the checked files to the Trash — recoverable until it is emptied."
+        )
+        self.lf_trash_btn.setEnabled(False)
+        self.lf_trash_btn.clicked.connect(self._on_trash_large_files)
+        lf_btn_row.addWidget(self.lf_trash_btn)
+        lf_btn_row.addStretch()
+        self.lf_status = QLabel("Press Scan to find the biggest files in your home folder.")
+        self.lf_status.setObjectName("table_footer")
+        lf_btn_row.addWidget(self.lf_status, stretch=1)
+        layout.addLayout(lf_btn_row)
+
+        self._lf_checked: set[str] = set()
+        self.lf_table.cellClicked.connect(self._on_lf_cell_clicked)
+        return page
+
+    def _on_large_file_scan(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self._lf_checked.clear()
+        self.lf_table.setRowCount(0)
+        self.lf_trash_btn.setEnabled(False)
+        self._set_busy(True)
+        self.lf_status.setText("Scanning… (up to a minute on a full disk)")
+        self._worker = MaintenanceWorker(
+            "large_files", min_size_mb=self.lf_size_spin.value()
+        )
+        self._worker.action_done.connect(self._on_action_done)
+        self._worker.start()
+
+    def _populate_large_files(self, report: dict) -> None:
+        self.lf_table.setRowCount(0)
+        for f in report.get("files", []):
+            row = self.lf_table.rowCount()
+            self.lf_table.insertRow(row)
+            chk = QTableWidgetItem()
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setCheckState(Qt.CheckState.Unchecked)
+            self.lf_table.setItem(row, 0, chk)
+            self.lf_table.setItem(row, 1, QTableWidgetItem(f["path"]))
+            self.lf_table.setItem(row, 2, QTableWidgetItem(f.get("modified", "")))
+            size_item = QTableWidgetItem(f["size_human"])
+            size_item.setForeground(QColor("#FF9F0A"))
+            self.lf_table.setItem(row, 3, size_item)
+        partial = " (partial — time budget hit)" if report.get("partial_scan") else ""
+        self.lf_status.setText(
+            f'{report.get("shown", 0)} files ≥ {report.get("min_size_mb", 0)} MB,'
+            f' {report.get("top_total_human", "0 B")} total'
+            f'{partial} — scanned {report.get("files_scanned", 0):,} files '
+            f'in {report.get("elapsed_seconds", 0)}s.'
+        )
+        self.lf_trash_btn.setEnabled(self.lf_table.rowCount() > 0)
+
+    def _on_lf_cell_clicked(self, row: int, _col: int) -> None:
+        chk = self.lf_table.item(row, 0)
+        path_item = self.lf_table.item(row, 1)
+        if chk is None or path_item is None:
+            return
+        path = path_item.text()
+        if chk.checkState() == Qt.CheckState.Checked:
+            self._lf_checked.add(path)
+        else:
+            self._lf_checked.discard(path)
+        self.lf_status.setText(f"{len(self._lf_checked)} file(s) checked.")
+
+    def _on_trash_large_files(self) -> None:
+        if not self._lf_checked:
+            QMessageBox.information(self, "Large Files", "Check files to trash first.")
+            return
+        listing = "\n".join(f"  · {p}" for p in sorted(self._lf_checked)[:20])
+        more = "\n  …" if len(self._lf_checked) > 20 else ""
+        answer = QMessageBox.question(
+            self,
+            "Trash files",
+            f"Move {len(self._lf_checked)} file(s) to the Trash?\n\n{listing}{more}\n\n"
+            "Recoverable until the Trash is emptied.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        import shutil as _shutil
+
+        trashed, failed = 0, 0
+        for path in sorted(self._lf_checked):
+            try:
+                src = Path(path)
+                if not src.is_file():
+                    failed += 1
+                    continue
+                stamp = time.strftime("%Y%m%d-%H%M%S")
+                target = Path.home() / ".Trash" / f"{src.name} ({stamp})"
+                src.rename(target)
+                trashed += 1
+            except OSError:
+                failed += 1
+        self._lf_checked.clear()
+        self.lf_status.setText(
+            f'✓ {trashed} file(s) trashed'
+            + (f', {failed} failed — see paths still listed' if failed else '')
+            + '. Recoverable in the Trash.'
+        )
+        self._populate_large_files_keep_missing()
+
+    def _populate_large_files_keep_missing(self) -> None:
+        """After trashing, drop rows whose file no longer exists."""
+        for row in range(self.lf_table.rowCount() - 1, -1, -1):
+            item = self.lf_table.item(row, 1)
+            if item and not Path(item.text()).exists():
+                self.lf_table.removeRow(row)
+        if self.lf_table.rowCount() == 0:
+            self.lf_trash_btn.setEnabled(False)
+
     # ── Maintenance-tab actions ─────────────────────────────────────────────
 
     # ── Actions ──────────────────────────────────────────────────────────────
@@ -2112,6 +2270,15 @@ class MaintenanceDialog(QDialog):
                 f'{"✓ Uninstalled — files in the Trash" if ok else "✗ Uninstall failed — see Maintenance tab report"}'
             )
             self._load_installed_apps()
+            return
+        if action == "large_files":
+            self._set_busy(False)
+            if ok:
+                import json as _jf
+
+                self._populate_large_files(_jf.loads(report))
+            else:
+                self.lf_status.setText(f"✗ Scan failed: {report[:200]}")
             return
         if action in ("repair", "accelerate", "force_quit"):
             self._refresh_apps()

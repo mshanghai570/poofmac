@@ -239,6 +239,8 @@ _KNOWN_TOOLS = {
     "thin_tm_snapshots", "purgeable_space", "get_maintenance_guide",
     # App uninstaller
     "list_installed_apps", "find_app_residuals", "uninstall_app",
+    # Large files
+    "find_large_files",
 }
 
 
@@ -350,6 +352,9 @@ MAINTENANCE TOOLS
   relaunch) for stale icons, a frozen Dock or desktop glitches.
 • app_acceleration — clear clipboard, recent lists, Finder/Dock state; warn
   that the clipboard will be lost. vacuum_mail=true compacts Mail's index.
+• find_large_files — the biggest user files (installers, videos, archives).
+  Read-only: report what you find with sizes and let the user decide; use
+  check_path_safety before proposing any of them for deletion.
 • list_installed_apps / find_app_residuals / uninstall_app — complete
   uninstalls: scan first, show the user the residual list, get their OK,
   then uninstall (Trash, recoverable). Keep preferences if they might
