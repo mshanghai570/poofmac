@@ -234,3 +234,21 @@ def recent_runs(count: int = 5) -> list[dict]:
         except json.JSONDecodeError:
             continue  # a truncated tail line from a crashed write
     return runs
+
+
+def history_summary(count: int = 10) -> dict:
+    """Compact history for the agent: what the timer did recently."""
+    runs = recent_runs(count)
+    ok = sum(1 for r in runs if r.get("success"))
+    return {
+        "scheduled": _PLIST_PATH.exists(),
+        "runs_found": len(runs),
+        "successful": ok,
+        "log_path": str(_log_path()),
+        "runs": runs,
+        "note": (
+            "Each run only reports and does reversible maintenance; it never "
+            "deletes user files. Large-file lists are informational — point the "
+            "user at the Large Files tab to trash anything."
+        ),
+    }

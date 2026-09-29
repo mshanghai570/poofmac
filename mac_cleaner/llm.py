@@ -243,6 +243,7 @@ _KNOWN_TOOLS = {
     "find_large_files",
     # Scheduled maintenance
     "maintenance_schedule",
+    "get_maintenance_history",
 }
 
 
@@ -361,6 +362,8 @@ MAINTENANCE TOOLS
   timer (LaunchAgent running the safe set: acceleration, snapshot thinning,
   large-file report). Only enable or remove it when the user asks; never
   deletes anything.
+• get_maintenance_history — what the timer did recently: runs, successes,
+  snapshots reclaimed, largest files spotted. Read-only.
 • list_installed_apps / find_app_residuals / uninstall_app — complete
   uninstalls: scan first, show the user the residual list, get their OK,
   then uninstall (Trash, recoverable). Keep preferences if they might

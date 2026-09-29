@@ -3313,9 +3313,13 @@ def run_gui(settings: Settings, safe_mode: bool = False) -> None:
 
     t = setup_theme(app)
 
-    disclaimer = DisclaimerDialog(t)
-    if disclaimer.exec() != QDialog.DialogCode.Accepted:
-        sys.exit(0)
+    # The safety disclaimer is a first-run gate, not a per-launch toll:
+    # acceptance is recorded in the config dir and it never shows again.
+    if not store.disclaimer_accepted():
+        disclaimer = DisclaimerDialog(t)
+        if disclaimer.exec() != QDialog.DialogCode.Accepted:
+            sys.exit(0)
+        store.mark_disclaimer_accepted()
 
     window = PoofMacWindow(settings, t, safe_mode=safe_mode)
     window.show()

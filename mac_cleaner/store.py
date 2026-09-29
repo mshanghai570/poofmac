@@ -40,6 +40,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 from urllib.parse import urlparse
@@ -91,6 +92,33 @@ def env_file() -> Path:
 def endpoints_file() -> Path:
     """``endpoints.json``, kept beside the ``.env`` it belongs to."""
     return env_file().parent / ENDPOINTS_FILE_NAME
+
+
+# ── Disclaimer acceptance ─────────────────────────────────────────────────────
+
+
+def disclaimer_file() -> Path:
+    """Marker file recording that the user accepted the safety disclaimer."""
+    return config_dir() / "disclaimer_accepted"
+
+
+def disclaimer_accepted() -> bool:
+    """True once the user has accepted the safety disclaimer (first run only)."""
+    try:
+        return disclaimer_file().is_file()
+    except OSError:
+        return False
+
+
+def mark_disclaimer_accepted() -> None:
+    """Record disclaimer acceptance; the prompt then never shows again."""
+    path = disclaimer_file()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(time.strftime("%Y-%m-%dT%H:%M:%S"), encoding="utf-8")
+        _restrict(path)
+    except OSError:
+        pass  # worst case the disclaimer shows again next launch
 
 
 def config_dir_is_writable() -> tuple[bool, str]:

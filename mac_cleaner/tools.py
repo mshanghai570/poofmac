@@ -265,6 +265,28 @@ TOOLS: list[dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_maintenance_history",
+            "description": (
+                "What the automatic maintenance timer did recently: past runs, "
+                "success/failure, snapshots thinned and the largest files found. "
+                "Read-only. Use when the user asks what the scheduled maintenance "
+                "has been doing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "count": {
+                        "type": "integer",
+                        "description": "How many past runs to return (default 10).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
     # ── App Uninstaller ──────────────────────────────────────────────
     {
         "type": "function",
@@ -587,6 +609,13 @@ def execute_tool(name: str, args: dict) -> str:
         if action == "disable":
             return json.dumps(scheduler.schedule_disable())
         return json.dumps(scheduler.schedule_status())
+
+    if name == "get_maintenance_history":
+        from mac_cleaner import scheduler as _sched
+
+        return json.dumps(
+            _sched.history_summary(count=int(args.get("count", 10) or 10))
+        )
 
     if name == "list_installed_apps":
         return json.dumps(maintenance.list_installed_apps())

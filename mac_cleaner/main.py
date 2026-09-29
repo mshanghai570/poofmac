@@ -68,7 +68,7 @@ from mac_cleaner.scanner import format_size, get_disk_usage
 
 
 class DisclaimerScreen(ModalScreen[bool]):
-    """Full-screen disclaimer shown on every launch."""
+    """Full-screen safety disclaimer, shown on first launch only."""
 
     DEFAULT_CSS = """
     DisclaimerScreen {
@@ -384,12 +384,21 @@ class MacCleanerApp(App):
 
     def on_mount(self) -> None:
         self._setup_table()
+        # Same first-run gate as the GUI: once accepted, recorded forever.
+        from mac_cleaner import store
+
+        if store.disclaimer_accepted():
+            self._after_disclaimer(True)
+            return
         self.push_screen(DisclaimerScreen(), self._after_disclaimer)
 
     def _after_disclaimer(self, accepted: bool) -> None:
         if not accepted:
             self.exit()
             return
+        from mac_cleaner import store
+
+        store.mark_disclaimer_accepted()
         self._refresh_disk_overview()
         log = self.query_one("#activity-log", RichLog)
         model_ok, model_msg = self.settings.validate_model_access()
