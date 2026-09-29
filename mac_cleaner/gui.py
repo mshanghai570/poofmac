@@ -1777,6 +1777,13 @@ COL_PATH     = 4
 # ── Main window ───────────────────────────────────────────────────────────────
 
 
+def _run_scheduled_set() -> dict:
+    """Run-now wrapper so the worker dispatch stays a flat dict of callables."""
+    from mac_cleaner import scheduler
+
+    return scheduler.run_safe_set()
+
+
 class MaintenanceWorker(QThread):
     """Runs one maintenance action off the GUI thread; emits a report."""
 
@@ -1802,6 +1809,7 @@ class MaintenanceWorker(QThread):
             "residuals": maintenance.find_app_residuals,
             "uninstall": maintenance.uninstall_app,
             "large_files": maintenance.find_large_files,
+            "scheduled_run": _run_scheduled_set,
         }.get(self.action)
         if fn is None:
             self.action_done.emit(self.action, False, f"Unknown action: {self.action!r}")
@@ -1835,6 +1843,7 @@ class MaintenanceDialog(QDialog):
         tabs.addTab(self._build_maintenance_tab(), "Maintenance")
         tabs.addTab(self._build_uninstaller_tab(), "App Uninstaller")
         tabs.addTab(self._build_large_files_tab(), "Large Files")
+        tabs.addTab(self._build_schedule_tab(), "Schedule")
 
         self._refresh_apps()
 
@@ -2231,15 +2240,157 @@ class MaintenanceDialog(QDialog):
         if self.lf_table.rowCount() == 0:
             self.lf_trash_btn.setEnabled(False)
 
-    # ── Maintenance-tab actions ─────────────────────────────────────────────
+    # ── Tab 4: Schedule ────────────────────────────────────────────────────
+
+    def _build_schedule_tab(self) -> QWidget:
+        from mac_cleaner import scheduler
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 12, 4, 4)
+        layout.setSpacing(10)
+
+        layout.addWidget(_section_label("Automatic maintenance"))
+        info = QLabel(
+            "Runs the safe set on a timer via a user LaunchAgent:\n"
+            "app acceleration (clipboard, recent lists, Finder/Dock restart), "
+            "Time Machine snapshot thinning, and a large-file report.\n"
+            "Nothing is ever deleted — the log records what a real run did."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        row = QHBoxLayout()
+        row.addWidget(_section_label("Run every"))
+        self.sched_interval = QComboBox()
+        for _hours, label in scheduler.INTERVAL_CHOICES:
+            self.sched_interval.addItem(label)
+        self.sched_interval.setCurrentIndex(1)  # Weekly default
+        row.addWidget(self.sched_interval)
+        self.sched_enable_btn = _btn("⏰  Enable Schedule", "secondary")
+        self.sched_enable_btn.setToolTip(
+            "Install a user LaunchAgent that runs the safe maintenance set "
+            "on the chosen interval. Remove it any time from this tab."
+        )
+        self.sched_enable_btn.clicked.connect(self._on_schedule_enable)
+        row.addWidget(self.sched_enable_btn)
+        self.sched_disable_btn = _btn("Remove Schedule", "secondary")
+        self.sched_disable_btn.clicked.connect(self._on_schedule_disable)
+        row.addWidget(self.sched_disable_btn)
+        self.sched_runnow_btn = _btn("▶  Run Now", "secondary")
+        self.sched_runnow_btn.setToolTip(
+            "Run the safe set right now and log it — same as the timer would."
+        )
+        self.sched_runnow_btn.clicked.connect(self._on_schedule_run_now)
+        row.addWidget(self.sched_runnow_btn)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self.sched_status = QLabel("")
+        self.sched_status.setObjectName("table_footer")
+        self.sched_status.setWordWrap(True)
+        layout.addWidget(self.sched_status)
+
+        layout.addWidget(_section_label("Recent runs"))
+        self.sched_table = QTableWidget(0, 4)
+        self.sched_table.setHorizontalHeaderLabels(["When", "Result", "Thinned", "Largest file"])
+        hh = self.sched_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.sched_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.sched_table.setAlternatingRowColors(True)
+        self.sched_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.sched_table, stretch=1)
+
+        self._refresh_schedule()
+        return page
+
+    def _refresh_schedule(self) -> None:
+        from mac_cleaner import scheduler
+
+        status = scheduler.schedule_status()
+        if status["installed"]:
+            self.sched_status.setText(
+                f"✓ Scheduled: {status['interval_label']} "
+                f"({status['plist']})"
+            )
+            self.sched_enable_btn.setEnabled(False)
+            self.sched_disable_btn.setEnabled(True)
+        else:
+            self.sched_status.setText("Not scheduled.")
+            self.sched_enable_btn.setEnabled(True)
+            self.sched_disable_btn.setEnabled(False)
+
+        self.sched_table.setRowCount(0)
+        for run in status.get("last_runs", []):
+            row = self.sched_table.rowCount()
+            self.sched_table.insertRow(row)
+            self.sched_table.setItem(row, 0, QTableWidgetItem(run.get("ran_at", "")))
+            result = QTableWidgetItem(
+                "✓ ok" if run.get("success") else "✗ failed"
+            )
+            if not run.get("success"):
+                result.setForeground(QColor("#FF3B30"))
+            self.sched_table.setItem(row, 1, result)
+            top = run.get("large_files_top", []) or [{}]
+            self.sched_table.setItem(
+                row, 3, QTableWidgetItem(top[0].get("path", ""))
+            )
+
+    def _on_schedule_enable(self) -> None:
+        from mac_cleaner import scheduler
+
+        hours = scheduler.INTERVAL_CHOICES[self.sched_interval.currentIndex()][0]
+        result = scheduler.schedule_enable(hours)
+        if result.get("success"):
+            QMessageBox.information(
+                self,
+                "Schedule",
+                f"Maintenance will run {result['interval_label']}.\n"
+                f"LaunchAgent: {result['plist']}",
+            )
+        else:
+            QMessageBox.warning(
+                self, "Schedule", f"Could not enable: {result.get('error', 'unknown error')}"
+            )
+        self._refresh_schedule()
+
+    def _on_schedule_disable(self) -> None:
+        from mac_cleaner import scheduler
+
+        result = scheduler.schedule_disable()
+        if not result.get("success"):
+            QMessageBox.warning(
+                self, "Schedule", f"Could not remove: {result.get('error', 'unknown error')}"
+            )
+        self._refresh_schedule()
+
+    def _on_schedule_run_now(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self.sched_status.setText("Running the safe set now… (about a minute)")
+        self._set_busy(True)
+        self._worker = MaintenanceWorker("scheduled_run")
+        self._worker.action_done.connect(self._on_action_done)
+        self._worker.start()
+
+    # ── Maintenance-tab actions ───────────────────────────────────────────
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def _set_busy(self, busy: bool) -> None:
         for btn in (self.repair_btn, self.accel_btn, self.snapshots_btn,
                     self.refresh_btn, self.quit_btn, self.kill_btn,
-                    self.uninstall_btn, self.installed_refresh_btn):
+                    self.uninstall_btn, self.installed_refresh_btn,
+                    self.sched_enable_btn, self.sched_disable_btn,
+                    self.sched_runnow_btn):
             btn.setEnabled(not busy)
+
+        # The enable/disable pair also reflects schedule state — restore it.
+        if not busy:
+            self._refresh_schedule()
 
     def _run_action(self, action: str, **kwargs) -> None:
         if self._worker is not None and self._worker.isRunning():
@@ -2279,6 +2430,14 @@ class MaintenanceDialog(QDialog):
                 self._populate_large_files(_jf.loads(report))
             else:
                 self.lf_status.setText(f"✗ Scan failed: {report[:200]}")
+            return
+        if action == "scheduled_run":
+            self._set_busy(False)
+            self._refresh_schedule()
+            if ok:
+                self.sched_status.setText("✓ Safe set ran — see the table and Maintenance tab report.")
+            else:
+                self.sched_status.setText("✗ Scheduled run had failures — see report.")
             return
         if action in ("repair", "accelerate", "force_quit"):
             self._refresh_apps()

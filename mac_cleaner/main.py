@@ -768,11 +768,33 @@ def run() -> None:
         help="Override the AI model for this run (e.g. qwen3.6:35b-a3b).",
     )
     parser.add_argument(
+        "--maintain",
+        action="store_true",
+        help="Headless scheduled maintenance run (used by the launchd timer).",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"poofmac {__version__}",
     )
     args = parser.parse_args()
+
+    if args.maintain:
+        # Scheduled maintenance: no Qt, no LLM, quiet unless it fails.
+        from mac_cleaner import scheduler
+
+        report = scheduler.run_safe_set()
+        if report.get("skipped"):
+            return
+        if not report.get("success", False):
+            print(
+                f"PoofMac scheduled maintenance had failures: "
+                f"{report.get('ran_at')} — see "
+                f"{scheduler._log_path()}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
 
     try:
         settings = Settings()

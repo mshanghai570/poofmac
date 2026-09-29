@@ -511,7 +511,7 @@ def purgeable_space() -> dict:
 def thin_tm_snapshots(keep_hours: int = 24) -> dict:
     """Ask Time Machine to thin local snapshots older than keep_hours."""
     ok, out = _run(
-        ["tmutil", "thinlocalsnapshots", "/", str(keep_hours * 3600 * 1_000_000_000), 1],
+        ["tmutil", "thinlocalsnapshots", "/", str(keep_hours * 3600 * 1_000_000_000), "1"],
         timeout=60.0,
     )
     reclaimed: list[str] = []

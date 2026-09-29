@@ -235,7 +235,37 @@ TOOLS: list[dict] = [
             },
         },
     },
-    # ── App Uninstaller ──────────────────────────────────────────────────
+    # ── Scheduled maintenance ────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "maintenance_schedule",
+            "description": (
+                "Manage the automatic maintenance timer (a user LaunchAgent that "
+                "runs the safe set — app acceleration, Time Machine snapshot "
+                "thinning, large-file report — and logs each run). action=\"status\" "
+                "checks it, action=\"enable\" installs it, action=\"disable\" removes "
+                "it. Never deletes user files. Only enable/disable when the user asks."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["status", "enable", "disable"],
+                        "description": "What to do (default: status).",
+                    },
+                    "interval": {
+                        "type": "string",
+                        "enum": ["daily", "weekly", "biweekly"],
+                        "description": "(enable) How often to run. Default weekly.",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    # ── App Uninstaller ──────────────────────────────────────────────
     {
         "type": "function",
         "function": {
@@ -544,6 +574,19 @@ def execute_tool(name: str, args: dict) -> str:
                 limit=int(args.get("limit", 30) or 30),
             )
         )
+
+    if name == "maintenance_schedule":
+        from mac_cleaner import scheduler
+
+        action = str(args.get("action", "status") or "status").lower()
+        if action == "enable":
+            hours = {"daily": 24, "weekly": 24 * 7}.get(
+                str(args.get("interval", "weekly") or "weekly").lower(), 24 * 7
+            )
+            return json.dumps(scheduler.schedule_enable(hours))
+        if action == "disable":
+            return json.dumps(scheduler.schedule_disable())
+        return json.dumps(scheduler.schedule_status())
 
     if name == "list_installed_apps":
         return json.dumps(maintenance.list_installed_apps())

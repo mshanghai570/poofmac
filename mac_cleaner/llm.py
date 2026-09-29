@@ -241,6 +241,8 @@ _KNOWN_TOOLS = {
     "list_installed_apps", "find_app_residuals", "uninstall_app",
     # Large files
     "find_large_files",
+    # Scheduled maintenance
+    "maintenance_schedule",
 }
 
 
@@ -355,6 +357,10 @@ MAINTENANCE TOOLS
 • find_large_files — the biggest user files (installers, videos, archives).
   Read-only: report what you find with sizes and let the user decide; use
   check_path_safety before proposing any of them for deletion.
+• maintenance_schedule — install/remove/check the automatic maintenance
+  timer (LaunchAgent running the safe set: acceleration, snapshot thinning,
+  large-file report). Only enable or remove it when the user asks; never
+  deletes anything.
 • list_installed_apps / find_app_residuals / uninstall_app — complete
   uninstalls: scan first, show the user the residual list, get their OK,
   then uninstall (Trash, recoverable). Keep preferences if they might
