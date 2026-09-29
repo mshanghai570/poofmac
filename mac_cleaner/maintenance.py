@@ -28,9 +28,11 @@ Guidance (needs Terminal; the LLM explains and the user runs it)
 
 from __future__ import annotations
 
+import os
 import plistlib
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -103,27 +105,277 @@ def heavy_consumers(limit: int = 10) -> dict:
     }
 
 
+# ── GUI application inventory (LaunchServices, no TCC permission needed) ──────
+
+# Apps a force-quit must never touch: killing them breaks the session.
+# Bundle ids are matched case-insensitively — lsappinfo reports inconsistent
+# casing (com.apple.dock vs com.apple.SystemUIServer vs com.apple.systemuiserver).
+_PROTECTED_BUNDLE_IDS = {
+    bid.lower()
+    for bid in (
+        "com.apple.finder", "com.apple.dock", "com.apple.systemuiserver",
+        "com.apple.loginwindow", "com.apple.WindowServer", "com.apple.Spotlight",
+        "com.apple.notificationcenterui", "com.apple.controlcenter",
+        "com.apple.WindowManager", "com.apple.dock.extra", "com.apple.dock.helper",
+    )
+}
+
+
+def _foreground_apps() -> list[dict]:
+    """GUI applications with name/pid/bundle id, from LaunchServices.
+
+    ``lsappinfo list`` is the same source Activity Monitor's Application list
+    uses, works without Accessibility/TCC approval (unlike System Events), and
+    one call answers for every app.
+    """
+    ok, out = _run(["lsappinfo", "list"], timeout=15.0)
+    apps: list[dict] = []
+    if not ok:
+        return apps
+    entries = re.split(r"\n\s*\d+\)\s", out)
+    for entry in entries[1:]:
+        name_m = re.match(r'"([^"]+)"', entry)
+        pid_m = re.search(r"pid = (\d+)", entry)
+        type_m = re.search(r'type="(\w+)"', entry)
+        bid_m = re.search(r'bundleID="([^"]+)"', entry)
+        if not (name_m and pid_m and type_m):
+            continue
+        # Dock and SystemUIServer register as UIElement, not Foreground —
+        # both are session apps the user can see and might need to quit.
+        # BackgroundOnly/XPC helpers are the ones to skip.
+        if type_m.group(1) not in ("Foreground", "UIElement"):
+            continue
+        apps.append(
+            {
+                "name": name_m.group(1),
+                "pid": int(pid_m.group(1)),
+                "bundle_id": bid_m.group(1) if bid_m else "",
+            }
+        )
+    return apps
+
+
 def hung_applications() -> dict:
-    """Apps whose process is not responding (same check Activity Monitor uses)."""
-    ok, out = _run(["ps", "-Ao", "pid,stat,comm"])
-    hung: list[dict] = []
-    if ok:
-        for line in out.splitlines()[1:]:
-            parts = line.strip().split(None, 2)
-            if len(parts) == 3:
-                pid, stat, comm = parts
-                # "!" in the process state flags = not responding
-                if "!" in stat:
-                    hung.append(
-                        {"pid": int(pid) if pid.isdigit() else pid, "state": stat, "command": comm}
-                    )
+    """GUI applications that look wedged, plus recent freeze reports.
+
+    Two signals, both cheap and permission-free:
+    • An app using no CPU while it should be frontmost-ish is *suspected* —
+      ps can't prove a hang, so these are labelled as such.
+    • macOS itself writes ``*.hang.ips`` diagnostic reports for any app whose
+      main thread froze for seconds — those are *confirmed* hangs on record.
+    """
+    reports_dir = Path.home() / "Library" / "Logs" / "DiagnosticReports"
+    hang_reports: list[dict] = []
+    if reports_dir.is_dir():
+        for report in sorted(reports_dir.glob("*.hang.ips"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
+            # Report names look like "AppName-2026-09-29-003608.hang.ips".
+            stem = report.name.removesuffix(".hang.ips")
+            app_name = stem.rsplit("-", 3)[0] if "-" in stem else stem
+            try:
+                age_hours = (time.time() - report.stat().st_mtime) / 3600
+            except OSError:
+                continue
+            hang_reports.append(
+                {
+                    "app": app_name,
+                    "report": report.name,
+                    "hours_ago": round(age_hours, 1),
+                }
+            )
+
+    suspected: list[dict] = []
+    for app in _foreground_apps():
+        ok, state = _run(["ps", "-o", "state=", "-p", str(app["pid"])], timeout=5.0)
+        s = state.strip()
+        # "U" = uninterruptible wait: the classic stuck-in-a-syscall signature.
+        if ok and "U" in s:
+            suspected.append({**app, "state": s})
+
     return {
-        "hung": hung,
-        "count": len(hung),
+        "gui_apps": _foreground_apps(),
+        "suspected_hung": suspected,
+        "hang_reports": hang_reports,
+        "count": len(suspected),
         "note": (
-            "A hung app can usually be forced to quit from the Apple menu "
-            "(Force Quit), or killed with: kill <pid>"
-        ) if hung else "Nothing is hung right now.",
+            "suspected_hung = apps stuck in an uninterruptible wait; hang_reports = "
+            "freezes macOS recorded. Any of them can be force-quit with "
+            "force_quit_app — ask the user first, unsaved work is lost."
+        ),
+    }
+
+
+# Apps SIGTERM politely asks to quit; SIGKILL is the seatbelt-cutting "force".
+
+def force_quit_app(identifier: str, force: bool = False) -> dict:
+    """Quit a misbehaving application by name, bundle id or pid.
+
+    Default is a polite SIGTERM (the app may save state and refuse).
+    force=True escalates to SIGKILL — unsaved work in that app is lost, so the
+    caller (LLM or GUI) must have the user's OK first. Apple's own session
+    apps are protected and refuse to be killed here.
+    """
+    if not identifier:
+        return {"success": False, "error": "Pass an app name, bundle id or pid."}
+
+    target: Optional[dict] = None
+    if identifier.isdigit():
+        target = next((a for a in _foreground_apps() if a["pid"] == int(identifier)), None)
+    else:
+        needle = identifier.lower()
+        target = next(
+            (
+                a for a in _foreground_apps()
+                if needle in (a["name"].lower(), a["bundle_id"].lower())
+            ),
+            None,
+        )
+    if target is None:
+        return {"success": False, "error": f"No GUI application matches {identifier!r}."}
+    if target["bundle_id"].lower() in _PROTECTED_BUNDLE_IDS:
+        return {
+            "success": False,
+            "error": (
+                f"{target['name']} is a macOS session app — killing it would break "
+                "the desktop. Use repair_applications to restart Finder or Dock "
+                "safely instead."
+            ),
+        }
+
+    pid = target["pid"]
+    try:
+        import signal
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+    except PermissionError:
+        return {"success": False, "error": f"{target['name']} runs as another user (likely root)."}
+    except ProcessLookupError:
+        return {"success": True, "app": target["name"], "note": "Already gone."}
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
+    return {
+        "success": True,
+        "app": target["name"],
+        "pid": pid,
+        "signal": "SIGKILL" if force else "SIGTERM",
+        "note": (
+            "Sent politely — the app may still save and exit on its own. "
+            "Re-run with force=true if it survives 5 seconds."
+        ) if not force else "Killed. Unsaved work in it is gone.",
+    }
+
+
+# ── Repair Applications / App Acceleration (no-sudo actions) ──────────────────
+
+_LSREGISTER = (
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+    "LaunchServices.framework/Support/lsregister"
+)
+
+
+def _gone_or_replaced(process_name: str) -> bool:
+    """Whether ``process_name`` quit (or a fresh copy already took over)."""
+    ok, out = _run(["pgrep", "-x", process_name], timeout=5.0)
+    if not ok or not out.strip():
+        return True  # gone — launchd will relaunch it
+    # Different pid than before would also be fine, but "still the same pid"
+    # just means launchd has not gotten to it yet; launchd always does.
+    return False
+
+
+def repair_applications(include_ls_rebuild: bool = False) -> dict:
+    """Restart the desktop's core apps and optionally rebuild Launch Services.
+
+    Finder/Dock/SystemUIServer misbehave far more often than they crash —
+    stale icons, a frozen Dock, empty desktop. ``killall`` is safe for exactly
+    these three: launchd relaunches them instantly with fresh state. The
+    Launch Services rebuild (user domain only, no sudo) fixes a broken or
+    duplicated "Open With" menu — it re-derives every app registration, so it
+    is off by default and only worth running when that symptom appears.
+    """
+    restarted: list[str] = []
+    failed: list[dict] = []
+    for service in ("Finder", "Dock", "SystemUIServer"):
+        # SIGTERM can block on an app that is mid-save, so signal, then just
+        # check the process left — never wait on killall itself.
+        ok, out = _run(["killall", service], timeout=3.0)
+        if ok or _gone_or_replaced(service):
+            restarted.append(service)
+        else:
+            failed.append({"service": service, "error": out.strip()[:120]})
+
+    ls_rebuilt = False
+    if include_ls_rebuild and Path(_LSREGISTER).is_file():
+        ok, out = _run(
+            [_LSREGISTER, "-kill", "-r", "-domain", "local", "-domain", "system", "-domain", "user"],
+            timeout=120.0,
+        )
+        ls_rebuilt = ok
+
+    return {
+        "success": bool(restarted),
+        "restarted": restarted,
+        "failed": failed,
+        "launch_services_rebuilt": ls_rebuilt,
+        "note": (
+            "launchd restarts each of these automatically with clean state. "
+            "Pass include_ls_rebuild=true only for a broken/duplicated 'Open With' "
+            "menu — the rebuild takes a minute and re-registers every app."
+        ),
+    }
+
+
+def app_acceleration(vacuum_mail: bool = False) -> dict:
+    """The low-risk speed-ups: purge stale UI state apps re-read on launch.
+
+    Clears the pasteboard, Finder's recent-items lists and the Dock's
+    tile cache — things apps re-derive on next launch, so nothing the user
+    created is touched. vacuum_mail=true additionally VACUUMs Mail's SQLite
+    index (Mail must be closed): same trick as the commercial cleaners, but it
+    reclaims space without deleting and rebuilding the index.
+    """
+    steps: list[dict] = []
+
+    ok, out = _run(["bash", "-c", "printf '' | pbcopy"], timeout=5.0)
+    steps.append({"step": "cleared clipboard", "success": ok})
+
+    shared = Path.home() / "Library" / "Application Support" / "com.apple.sharedfilelist"
+    cleared = 0
+    if shared.is_dir():
+        for sfl in shared.glob("**/*.sfl3"):
+            # These are 'recent documents/projects' lists. macOS recreates them
+            # empty; deleting beats truncating because .sfl3 readers choke on
+            # a zero-byte file.
+            try:
+                sfl.unlink()
+                cleared += 1
+            except OSError:
+                pass
+    steps.append({"step": "cleared recent-items lists", "files": cleared, "success": True})
+
+    ok, _ = _run(["killall", "Finder", "Dock"], timeout=10.0)
+    steps.append({"step": "restarted Finder and Dock", "success": ok})
+
+    mail_vacuumed = False
+    if vacuum_mail:
+        mail_runs = _run(["pgrep", "-x", "Mail"], timeout=5.0)[1].strip()
+        if mail_runs:
+            steps.append({"step": "Mail index vacuum", "success": False, "error": "Mail is running — quit it first."})
+        else:
+            ok, out = _run(
+                ["bash", "-c", "find ~/Library/Mail -name 'Envelope Index' -exec sqlite3 {} 'VACUUM;' \\\\;"],
+                timeout=300.0,
+            )
+            mail_vacuumed = ok
+            steps.append({"step": "Mail index vacuum", "success": ok, "error": out.strip()[:120] if not ok else ""})
+
+    return {
+        "success": all(s.get("success") for s in steps),
+        "steps": steps,
+        "mail_vacuumed": mail_vacuumed,
+        "note": (
+            "These clear state macOS rebuilds automatically — no user data is "
+            "touched. For app-specific slowdowns, an app's own caches usually "
+            "matter more: scan_category('caches') finds the big ones."
+        ),
     }
 
 
@@ -357,13 +609,14 @@ MAINTENANCE_GUIDES: dict[str, dict] = {
         "title": "Speed up Mail",
         "needs_sudo": False,
         "commands": [
-            "# Quit Mail first, then rebuild its database index:",
-            "rm -rf ~/Library/Mail/V*/MailData/Envelope\\ Index*",
+            "# Quit Mail first, then compact its database index (safe — no rebuild):",
+            "find ~/Library/Mail -name 'Envelope Index' -exec sqlite3 {} 'VACUUM;' \\;",
         ],
         "explanation": (
-            "Mail re-creates its search index on next launch, which fixes slow "
-            "search and missing messages. Mail itself and all messages are untouched — "
-            "only the index is rebuilt (it can take a while on large mailboxes)."
+            "VACUUM compacts Mail's SQLite search index, reclaiming space and "
+            "fixing slow search — without deleting anything, so Mail need not "
+            "rebuild the index on next launch. PoofMac can do this in-app via "
+            "app_acceleration(vacuum_mail=true)."
         ),
     },
 }

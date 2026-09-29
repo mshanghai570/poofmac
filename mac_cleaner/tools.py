@@ -35,6 +35,11 @@ from mac_cleaner.scanner import (
     format_size,
 )
 
+
+def _result_ok(payload: object) -> bool:
+    """Whether a maintenance result dict reports success."""
+    return isinstance(payload, dict) and payload.get("success") is True
+
 # ── Tool schema ───────────────────────────────────────────────────────────────
 
 TOOLS: list[dict] = [
@@ -127,10 +132,83 @@ TOOLS: list[dict] = [
         "function": {
             "name": "hung_applications",
             "description": (
-                "List applications that are not responding (hung). Read-only. "
-                "Pair with advice from the tool result on force-quitting them."
+                "List running GUI applications, ones suspected of hanging (stuck in "
+                "an uninterruptible wait) and recorded freeze reports. Read-only. "
+                "Follow with force_quit_app — with the user's OK, unsaved work is lost."
             ),
             "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "force_quit_app",
+            "description": (
+                "Quit a misbehaving application by name, bundle id or pid. Default "
+                "asks politely (SIGTERM); force=true kills it hard (SIGKILL). ALWAYS "
+                "confirm with the user first — unsaved work is lost, especially on "
+                "force. macOS session apps (Finder, Dock) are refused; use "
+                "repair_applications for those."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "identifier": {
+                        "type": "string",
+                        "description": "App name, bundle id, or pid (e.g. 'Safari', 'com.apple.Safari', '1234').",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "true = SIGKILL immediately; false = polite SIGTERM first (default).",
+                    },
+                },
+                "required": ["identifier"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "repair_applications",
+            "description": (
+                "Restart Finder, Dock and SystemUIServer — the fix for stale icons, a "
+                "frozen Dock, desktop glitches. launchd relaunches them instantly, so "
+                "nothing is lost. Optionally also rebuild the user-domain Launch "
+                "Services database (include_ls_rebuild=true) for a broken or "
+                "duplicated 'Open With' menu — slow, so only on that symptom."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_ls_rebuild": {
+                        "type": "boolean",
+                        "description": "Also rebuild the Launch Services app registry (default false).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "app_acceleration",
+            "description": (
+                "Clear low-risk UI state that apps re-derive on launch: clipboard, "
+                "recent-items lists, Finder/Dock caches (restarts both). Optionally "
+                "compact Mail's search index with vacuum_mail=true (Mail must be "
+                "quit). Tell the user clipboard contents will be lost."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "vacuum_mail": {
+                        "type": "boolean",
+                        "description": "Also VACUUM Mail's SQLite index (default false).",
+                    }
+                },
+                "required": [],
+            },
         },
     },
     {
@@ -358,6 +436,25 @@ def execute_tool(name: str, args: dict) -> str:
 
     if name == "hung_applications":
         return json.dumps(maintenance.hung_applications())
+
+    if name == "force_quit_app":
+        return json.dumps(
+            maintenance.force_quit_app(
+                str(args.get("identifier", "")), bool(args.get("force", False))
+            )
+        )
+
+    if name == "repair_applications":
+        return json.dumps(
+            maintenance.repair_applications(
+                include_ls_rebuild=bool(args.get("include_ls_rebuild", False))
+            )
+        )
+
+    if name == "app_acceleration":
+        return json.dumps(
+            maintenance.app_acceleration(vacuum_mail=bool(args.get("vacuum_mail", False)))
+        )
 
     if name == "launch_agents":
         return json.dumps(maintenance.launch_agents())

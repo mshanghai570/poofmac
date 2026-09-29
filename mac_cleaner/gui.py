@@ -1776,6 +1776,234 @@ COL_PATH     = 4
 # ── Main window ───────────────────────────────────────────────────────────────
 
 
+class MaintenanceWorker(QThread):
+    """Runs one maintenance action off the GUI thread; emits a report."""
+
+    action_done = Signal(str, bool, str)  # action key, success, report
+
+    def __init__(self, action: str, **kwargs) -> None:
+        super().__init__()
+        self.action = action
+        self.kwargs = kwargs
+
+    def run(self) -> None:
+        import json as _json
+
+        from mac_cleaner import maintenance
+
+        fn = {
+            "report": maintenance.hung_applications,
+            "force_quit": maintenance.force_quit_app,
+            "repair": maintenance.repair_applications,
+            "accelerate": maintenance.app_acceleration,
+            "thin_snapshots": maintenance.thin_tm_snapshots,
+        }.get(self.action)
+        if fn is None:
+            self.action_done.emit(self.action, False, f"Unknown action: {self.action!r}")
+            return
+        try:
+            result = fn(**self.kwargs)
+        except Exception as exc:  # noqa: BLE001 — report, never crash the dialog
+            self.action_done.emit(self.action, False, f"Unexpected error: {exc}")
+            return
+        # Report-only tools (hung_applications) carry no success flag —
+        # producing a report IS success; only an error key means failure.
+        ok = result.get("success", "error" not in result)
+        self.action_done.emit(self.action, bool(ok), _json.dumps(result, indent=2))
+
+
+class MaintenanceDialog(QDialog):
+    """One-click maintenance panel: repair apps, accelerate, force-quit hung apps."""
+
+    def __init__(self, parent) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Maintenance")
+        self.resize(720, 620)
+        self._worker: Optional[MaintenanceWorker] = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        title = QLabel("Maintenance & Optimization")
+        title.setObjectName("dialog_title")
+        layout.addWidget(title)
+
+        # ── One-click actions ────────────────────────────────────────────
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
+
+        self.vacuum_mail_check = QCheckBox("Also compact Mail index")
+        self.vacuum_mail_check.setToolTip(
+            "VACUUM Mail's SQLite search index. Mail must be quit first."
+        )
+
+        self.repair_btn = _btn("🛠  Repair Applications", "secondary")
+        self.repair_btn.setToolTip(
+            "Restart Finder, Dock and SystemUIServer — launchd relaunches them "
+            "instantly. Fixes stale icons, a frozen Dock, desktop glitches."
+        )
+        self.repair_btn.clicked.connect(lambda: self._run_action("repair"))
+        actions_row.addWidget(self.repair_btn)
+
+        self.accel_btn = _btn("⚡  App Acceleration", "secondary")
+        self.accel_btn.setToolTip(
+            "Clear clipboard, recent-items lists and Finder/Dock state. "
+            "Apps rebuild all of it on next launch."
+        )
+        self.accel_btn.clicked.connect(
+            lambda: self._run_action(
+                "accelerate", vacuum_mail=self.vacuum_mail_check.isChecked()
+            )
+        )
+        actions_row.addWidget(self.accel_btn)
+        actions_row.addWidget(self.vacuum_mail_check)
+
+        self.snapshots_btn = _btn("🕒  Thin TM Snapshots", "secondary")
+        self.snapshots_btn.setToolTip(
+            "Ask Time Machine to delete local snapshots older than 24h, "
+            "reclaiming purgeable disk space."
+        )
+        self.snapshots_btn.clicked.connect(self._on_thin_snapshots)
+        actions_row.addWidget(self.snapshots_btn)
+        actions_row.addStretch()
+        layout.addLayout(actions_row)
+
+        # ── Running applications table ───────────────────────────────────
+        layout.addWidget(_section_label("Running applications"))
+        self.apps_table = QTableWidget(0, 3)
+        self.apps_table.setHorizontalHeaderLabels(["Application", "PID", "Status"])
+        self.apps_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.apps_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.apps_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.apps_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.apps_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.apps_table.setAlternatingRowColors(True)
+        self.apps_table.verticalHeader().setVisible(False)
+        self.apps_table.setMinimumHeight(200)
+        layout.addWidget(self.apps_table, stretch=1)
+
+        apps_btn_row = QHBoxLayout()
+        self.refresh_btn = _btn("↻  Refresh", "secondary")
+        self.refresh_btn.clicked.connect(self._refresh_apps)
+        apps_btn_row.addWidget(self.refresh_btn)
+        self.quit_btn = _btn("Quit App (polite)", "secondary")
+        self.quit_btn.setToolTip("Ask the app to quit (SIGTERM) — it may save state.")
+        self.quit_btn.clicked.connect(lambda: self._on_force_quit(force=False))
+        apps_btn_row.addWidget(self.quit_btn)
+        self.kill_btn = _btn("✖  Force Quit", "danger")
+        self.kill_btn.setToolTip("Kill the app immediately (SIGKILL) — unsaved work is lost.")
+        self.kill_btn.clicked.connect(lambda: self._on_force_quit(force=True))
+        apps_btn_row.addWidget(self.kill_btn)
+        apps_btn_row.addStretch()
+        layout.addLayout(apps_btn_row)
+
+        # ── Report area ──────────────────────────────────────────────────
+        layout.addWidget(_section_label("Report"))
+        self.report_view = QTextBrowser()
+        self.report_view.setMinimumHeight(120)
+        layout.addWidget(self.report_view, stretch=1)
+
+        self._refresh_apps()
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+
+    def _set_busy(self, busy: bool) -> None:
+        for btn in (self.repair_btn, self.accel_btn, self.snapshots_btn,
+                    self.refresh_btn, self.quit_btn, self.kill_btn):
+            btn.setEnabled(not busy)
+
+    def _run_action(self, action: str, **kwargs) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self._set_busy(True)
+        self.report_view.append(f"<b>Running {action}…</b>")
+        self._worker = MaintenanceWorker(action, **kwargs)
+        self._worker.action_done.connect(self._on_action_done)
+        self._worker.start()
+
+    def _on_action_done(self, action: str, ok: bool, report: str) -> None:
+        self._set_busy(False)
+        color = "#28CD41" if ok else "#FF3B30"
+        label = {
+            "repair": "Repair Applications",
+            "accelerate": "App Acceleration",
+            "force_quit": "Force Quit",
+            "thin_snapshots": "Thin Snapshots",
+        }.get(action, action)
+        self.report_view.append(
+            f'<span style="color:{color};"><b>{"✓" if ok else "✗"} {label}</b></span>'
+        )
+        self.report_view.append(f"<pre>{report}</pre>")
+        if action in ("repair", "accelerate", "force_quit"):
+            self._refresh_apps()
+
+    def _refresh_apps(self) -> None:
+        """Fill the app table synchronously — the lsappinfo call is fast."""
+        from mac_cleaner import maintenance
+
+        report = maintenance.hung_applications()
+        apps = report.get("gui_apps", [])
+        suspected = {a["pid"] for a in report.get("suspected_hung", [])}
+
+        self.apps_table.setRowCount(0)
+        for app in sorted(apps, key=lambda a: a["name"].casefold()):
+            row = self.apps_table.rowCount()
+            self.apps_table.insertRow(row)
+            self.apps_table.setItem(row, 0, QTableWidgetItem(app["name"]))
+            self.apps_table.setItem(row, 1, QTableWidgetItem(str(app["pid"])))
+            status = "⚠ suspected hung" if app["pid"] in suspected else "running"
+            item = QTableWidgetItem(status)
+            if app["pid"] in suspected:
+                item.setForeground(QColor("#FF9F0A"))
+            self.apps_table.setItem(row, 2, item)
+
+    def _selected_app(self) -> Optional[dict]:
+        from mac_cleaner import maintenance
+
+        rows = {i.row() for i in self.apps_table.selectedIndexes()}
+        if len(rows) != 1:
+            return None
+        name_item = self.apps_table.item(rows.pop(), 0)
+        if name_item is None:
+            return None
+        apps = maintenance._foreground_apps()
+        wanted = name_item.text()
+        return next((a for a in apps if a["name"] == wanted), None)
+
+    def _on_force_quit(self, force: bool) -> None:
+        app = self._selected_app()
+        if app is None:
+            QMessageBox.information(self, "Maintenance", "Select one application first.")
+            return
+        verb = "Force quit" if force else "Quit"
+        answer = QMessageBox.question(
+            self,
+            verb,
+            f'{verb} "{app["name"]}"?'
+            + ("\n\nUnsaved work in it will be lost." if force else ""),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._run_action("force_quit", identifier=str(app["pid"]), force=force)
+
+    def _on_thin_snapshots(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Thin Snapshots",
+            "Ask Time Machine to delete local snapshots older than 24 hours?\n\n"
+            "They exist to let you recover earlier file versions — deleting the "
+            "old ones frees disk space but shortens that recovery window.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._run_action("thin_snapshots", keep_hours=24)
+
+    def closeEvent(self, event) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.wait(1500)
+        super().closeEvent(event)
+
+
 class PoofMacWindow(QMainWindow):
     def __init__(self, settings: Settings, t: Theme, safe_mode: bool = False) -> None:
         super().__init__()
@@ -1873,11 +2101,19 @@ class PoofMacWindow(QMainWindow):
         self.safe_check.toggled.connect(self._on_safe_mode_toggled)
         layout.addWidget(self.safe_check)
 
+        maintenance_btn = _btn("🧰", "icon_btn")
+        maintenance_btn.setToolTip("Maintenance — repair apps, acceleration, hung apps")
+        maintenance_btn.clicked.connect(self._open_maintenance)
+        layout.addWidget(maintenance_btn)
+
         settings_btn = _btn("⚙", "icon_btn")
         settings_btn.setToolTip("Settings — API keys, models, safety")
         settings_btn.clicked.connect(self._open_settings)
         layout.addWidget(settings_btn)
         return bar
+
+    def _open_maintenance(self) -> None:
+        MaintenanceDialog(self).exec()
 
     # ── Disk card ──────────────────────────────────────────────────────────────
 

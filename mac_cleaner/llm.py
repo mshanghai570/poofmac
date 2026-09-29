@@ -233,7 +233,8 @@ _KNOWN_TOOLS = {
     "get_disk_overview", "run_full_disk_scan", "scan_category",
     "check_path_safety", "propose_cleanup_plan",
     # Maintenance & optimization
-    "heavy_consumers", "hung_applications", "launch_agents",
+    "heavy_consumers", "hung_applications", "force_quit_app",
+    "repair_applications", "app_acceleration", "launch_agents",
     "toggle_launch_agent", "memory_report", "tm_snapshots",
     "thin_tm_snapshots", "purgeable_space", "get_maintenance_guide",
 }
@@ -340,7 +341,13 @@ DISK-SCAN WORKFLOW — only when the user wants disk space cleaned
 MAINTENANCE TOOLS
 ─────────────────
 • heavy_consumers — what is using CPU/RAM right now.
-• hung_applications — apps not responding.
+• hung_applications — GUI apps, suspected hangs and recorded freezes.
+• force_quit_app — quit or kill a misbehaving app. ALWAYS ask the user first
+  and warn that unsaved work is lost; use force=true only as a last resort.
+• repair_applications — restart Finder/Dock/SystemUIServer (safe, instant
+  relaunch) for stale icons, a frozen Dock or desktop glitches.
+• app_acceleration — clear clipboard, recent lists, Finder/Dock state; warn
+  that the clipboard will be lost. vacuum_mail=true compacts Mail's index.
 • launch_agents / toggle_launch_agent — what runs at login; you may disable
   a USER agent, but always tell the user which one and why, and get their OK.
 • memory_report — RAM pressure, purgeable memory, swap.
