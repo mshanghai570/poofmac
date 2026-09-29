@@ -44,6 +44,8 @@ jobs:
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job, so tell gh which repo to publish to.
+          GH_REPO: ${{ github.repository }}
         run: |
           TAG="v1.0.${{ github.event.workflow_run.run_number }}"
 
