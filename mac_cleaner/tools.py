@@ -211,6 +211,63 @@ TOOLS: list[dict] = [
             },
         },
     },
+    # ── App Uninstaller ──────────────────────────────────────────────────
+    {
+        "type": "function",
+        "function": {
+            "name": "list_installed_apps",
+            "description": (
+                "List installed applications with their bundle ids and paths. "
+                "Read-only. Use to find the app a user means by a fuzzy name "
+                "before uninstalling it."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_app_residuals",
+            "description": (
+                "Show every file an application left in ~/Library (caches, "
+                "preferences, containers, logs…) with sizes. Read-only. ALWAYS "
+                "call this before uninstall_app and show the user what will be "
+                "removed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "bundle_id": {"type": "string", "description": "The app's bundle id, e.g. com.vendor.app."},
+                    "app_name": {"type": "string", "description": "App name as fallback when the bundle id is unknown."},
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "uninstall_app",
+            "description": (
+                "Move an application and its residual files to the Trash "
+                "(recoverable, never rm). Refuses running apps and SIP-protected "
+                "system apps. ALWAYS confirm with the user, and show them the "
+                "residuals list first. Set remove_preferences=false to keep their "
+                "settings for a future reinstall."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app_path": {"type": "string", "description": "Full path to the .app bundle."},
+                    "remove_preferences": {
+                        "type": "boolean",
+                        "description": "Also remove settings plists (default true).",
+                    },
+                },
+                "required": ["app_path"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -454,6 +511,24 @@ def execute_tool(name: str, args: dict) -> str:
     if name == "app_acceleration":
         return json.dumps(
             maintenance.app_acceleration(vacuum_mail=bool(args.get("vacuum_mail", False)))
+        )
+
+    if name == "list_installed_apps":
+        return json.dumps(maintenance.list_installed_apps())
+
+    if name == "find_app_residuals":
+        return json.dumps(
+            maintenance.find_app_residuals(
+                str(args.get("bundle_id", "")), str(args.get("app_name", ""))
+            )
+        )
+
+    if name == "uninstall_app":
+        return json.dumps(
+            maintenance.uninstall_app(
+                str(args.get("app_path", "")),
+                remove_preferences=bool(args.get("remove_preferences", True)),
+            )
         )
 
     if name == "launch_agents":

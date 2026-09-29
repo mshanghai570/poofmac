@@ -1797,6 +1797,9 @@ class MaintenanceWorker(QThread):
             "repair": maintenance.repair_applications,
             "accelerate": maintenance.app_acceleration,
             "thin_snapshots": maintenance.thin_tm_snapshots,
+            "list_apps": maintenance.list_installed_apps,
+            "residuals": maintenance.find_app_residuals,
+            "uninstall": maintenance.uninstall_app,
         }.get(self.action)
         if fn is None:
             self.action_done.emit(self.action, False, f"Unknown action: {self.action!r}")
@@ -1813,21 +1816,32 @@ class MaintenanceWorker(QThread):
 
 
 class MaintenanceDialog(QDialog):
-    """One-click maintenance panel: repair apps, accelerate, force-quit hung apps."""
+    """Maintenance panel: one-click actions, hung apps, and the uninstaller."""
 
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.setWindowTitle("Maintenance")
-        self.resize(720, 620)
+        self.resize(780, 660)
         self._worker: Optional[MaintenanceWorker] = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
 
-        title = QLabel("Maintenance & Optimization")
-        title.setObjectName("dialog_title")
-        layout.addWidget(title)
+        tabs = QTabWidget()
+        outer.addWidget(tabs, stretch=1)
+
+        tabs.addTab(self._build_maintenance_tab(), "Maintenance")
+        tabs.addTab(self._build_uninstaller_tab(), "App Uninstaller")
+
+        self._refresh_apps()
+
+    # ── Tab 1: Maintenance ──────────────────────────────────────────────────
+
+    def _build_maintenance_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 12, 4, 4)
+        layout.setSpacing(10)
 
         # ── One-click actions ────────────────────────────────────────────
         actions_row = QHBoxLayout()
@@ -1904,13 +1918,169 @@ class MaintenanceDialog(QDialog):
         self.report_view.setMinimumHeight(120)
         layout.addWidget(self.report_view, stretch=1)
 
-        self._refresh_apps()
+        return page
+
+    # ── Tab 2: App Uninstaller ──────────────────────────────────────────────
+
+    def _build_uninstaller_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 12, 4, 4)
+        layout.setSpacing(10)
+
+        top_row = QHBoxLayout()
+        self.uninst_search = QLineEdit()
+        self.uninst_search.setPlaceholderText("Filter installed applications…")
+        self.uninst_search.textChanged.connect(self._filter_installed)
+        top_row.addWidget(self.uninst_search, stretch=1)
+        self.installed_refresh_btn = _btn("↻  Refresh", "secondary")
+        self.installed_refresh_btn.clicked.connect(self._load_installed_apps)
+        top_row.addWidget(self.installed_refresh_btn)
+        layout.addLayout(top_row)
+
+        self.installed_table = QTableWidget(0, 3)
+        self.installed_table.setHorizontalHeaderLabels(["Application", "Bundle ID", "Location"])
+        self.installed_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.installed_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.installed_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.installed_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.installed_table.itemSelectionChanged.connect(self._show_residuals_for_selection)
+        self.installed_table.setAlternatingRowColors(True)
+        self.installed_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.installed_table, stretch=2)
+
+        self.uninstall_btn = _btn("🗑  Uninstall Selected…", "danger")
+        self.uninstall_btn.setToolTip(
+            "Scan the app's leftover files, show them, then move app + residuals "
+            "to the Trash (recoverable) after you confirm."
+        )
+        self.uninstall_btn.clicked.connect(self._on_uninstall_clicked)
+        layout.addWidget(self.uninstall_btn)
+
+        layout.addWidget(_section_label("Residual files (what uninstall would remove)"))
+        self.residuals_table = QTableWidget(0, 3)
+        self.residuals_table.setHorizontalHeaderLabels(["File", "Kind", "Size"])
+        self.residuals_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.residuals_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.residuals_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.residuals_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.residuals_table.setAlternatingRowColors(True)
+        self.residuals_table.verticalHeader().setVisible(False)
+        self.residuals_table.setMinimumHeight(140)
+        layout.addWidget(self.residuals_table, stretch=1)
+
+        self.uninst_status = QLabel("Select an application to see its leftover files.")
+        self.uninst_status.setObjectName("table_footer")
+        layout.addWidget(self.uninst_status)
+
+        self._installed_cache: list[dict] = []
+        self._selected_bundle: Optional[dict] = None
+        self.uninstall_btn.setEnabled(False)
+        self._load_installed_apps()
+        return page
+
+    # ── Uninstaller logic ──────────────────────────────────────────────────
+
+    def _load_installed_apps(self) -> None:
+        """Fill the installed-apps table (fast: Info.plist reads only)."""
+        from mac_cleaner import maintenance
+
+        report = maintenance.list_installed_apps()
+        self._installed_cache = report.get("apps", [])
+        self._filter_installed("")
+
+    def _filter_installed(self, text: str) -> None:
+        needle = text.strip().lower()
+        self.installed_table.setRowCount(0)
+        for app in self._installed_cache:
+            if needle and needle not in app["name"].lower() and needle not in app["bundle_id"].lower():
+                continue
+            row = self.installed_table.rowCount()
+            self.installed_table.insertRow(row)
+            self.installed_table.setItem(row, 0, QTableWidgetItem(app["name"]))
+            bid_item = QTableWidgetItem(app["bundle_id"] or "—")
+            if app["path"].startswith("/System/Applications/"):
+                bid_item.setForeground(QColor("#8E8E93"))
+                bid_item.setText(f"🔒 {app['bundle_id'] or 'system'}")
+            self.installed_table.setItem(row, 1, bid_item)
+            self.installed_table.setItem(row, 2, QTableWidgetItem(app["path"]))
+
+    def _on_uninstall_clicked(self) -> None:
+        rows = {i.row() for i in self.installed_table.selectedIndexes()}
+        if len(rows) != 1:
+            QMessageBox.information(self, "App Uninstaller", "Select one application first.")
+            return
+        row = rows.pop()
+        path_item = self.installed_table.item(row, 2)
+        if path_item is None:
+            return
+        app_path = path_item.text()
+        from mac_cleaner import maintenance
+
+        # SIP-protected: refuse before the user bothers confirming.
+        if app_path.startswith("/System/Applications/"):
+            QMessageBox.warning(
+                self,
+                "App Uninstaller",
+                "That app is part of macOS (SIP-protected) and cannot be removed.",
+            )
+            return
+
+        # Show exactly what would be trashed, then confirm once.
+        app = next((a for a in self._installed_cache if a["path"] == app_path), {})
+        scan = maintenance.find_app_residuals(app.get("bundle_id", ""), app.get("name", ""))
+        residuals = scan.get("residuals", [])
+        listing = "\n".join(f"  · {r['kind']}: {r['path']} ({r['size_human']})" for r in residuals)
+        answer = QMessageBox.question(
+            self,
+            "Uninstall",
+            f'Move "{app.get("name", app_path)}" and its leftover files to the Trash?\n\n'
+            f"{len(residuals)} item(s), {scan.get('total_human', '0 B')}:\n{listing or '  · (none found)'}\n\n"
+            "Everything stays recoverable in the Trash.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._set_busy(True)
+        self.uninst_status.setText(f"Uninstalling {app.get('name', '')}…")
+        self._worker = MaintenanceWorker("uninstall", app_path=app_path)
+        self._worker.action_done.connect(self._on_action_done)
+        self._worker.start()
+
+    def _show_residuals_for_selection(self) -> None:
+        """Live-update the residuals table as the user clicks an app."""
+        rows = {i.row() for i in self.installed_table.selectedIndexes()}
+        if len(rows) != 1:
+            return
+        path_item = self.installed_table.item(rows.pop(), 2)
+        if path_item is None:
+            return
+        app_path = path_item.text()
+        app = next((a for a in self._installed_cache if a["path"] == app_path), {})
+        from mac_cleaner import maintenance
+
+        scan = maintenance.find_app_residuals(app.get("bundle_id", ""), app.get("name", ""))
+        residuals = scan.get("residuals", [])
+        self.residuals_table.setRowCount(0)
+        for r in residuals:
+            row = self.residuals_table.rowCount()
+            self.residuals_table.insertRow(row)
+            self.residuals_table.setItem(row, 0, QTableWidgetItem(r["path"]))
+            self.residuals_table.setItem(row, 1, QTableWidgetItem(r["kind"]))
+            self.residuals_table.setItem(row, 2, QTableWidgetItem(r["size_human"]))
+        self.uninst_status.setText(
+            f'{app.get("name", "App")}: {len(residuals)} leftover item(s), '
+            f'{scan.get("total_human", "0 B")} — nothing removed yet.'
+        )
+
+    # ── Maintenance-tab actions ─────────────────────────────────────────────
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
     def _set_busy(self, busy: bool) -> None:
         for btn in (self.repair_btn, self.accel_btn, self.snapshots_btn,
-                    self.refresh_btn, self.quit_btn, self.kill_btn):
+                    self.refresh_btn, self.quit_btn, self.kill_btn,
+                    self.uninstall_btn, self.installed_refresh_btn):
             btn.setEnabled(not busy)
 
     def _run_action(self, action: str, **kwargs) -> None:
@@ -1930,11 +2100,19 @@ class MaintenanceDialog(QDialog):
             "accelerate": "App Acceleration",
             "force_quit": "Force Quit",
             "thin_snapshots": "Thin Snapshots",
+            "uninstall": "Uninstall",
         }.get(action, action)
         self.report_view.append(
             f'<span style="color:{color};"><b>{"✓" if ok else "✗"} {label}</b></span>'
         )
         self.report_view.append(f"<pre>{report}</pre>")
+        if action == "uninstall":
+            self._set_busy(False)
+            self.uninst_status.setText(
+                f'{"✓ Uninstalled — files in the Trash" if ok else "✗ Uninstall failed — see Maintenance tab report"}'
+            )
+            self._load_installed_apps()
+            return
         if action in ("repair", "accelerate", "force_quit"):
             self._refresh_apps()
 

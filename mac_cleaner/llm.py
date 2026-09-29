@@ -237,6 +237,8 @@ _KNOWN_TOOLS = {
     "repair_applications", "app_acceleration", "launch_agents",
     "toggle_launch_agent", "memory_report", "tm_snapshots",
     "thin_tm_snapshots", "purgeable_space", "get_maintenance_guide",
+    # App uninstaller
+    "list_installed_apps", "find_app_residuals", "uninstall_app",
 }
 
 
@@ -348,6 +350,10 @@ MAINTENANCE TOOLS
   relaunch) for stale icons, a frozen Dock or desktop glitches.
 • app_acceleration — clear clipboard, recent lists, Finder/Dock state; warn
   that the clipboard will be lost. vacuum_mail=true compacts Mail's index.
+• list_installed_apps / find_app_residuals / uninstall_app — complete
+  uninstalls: scan first, show the user the residual list, get their OK,
+  then uninstall (Trash, recoverable). Keep preferences if they might
+  reinstall. Never uninstall without an explicit confirmation.
 • launch_agents / toggle_launch_agent — what runs at login; you may disable
   a USER agent, but always tell the user which one and why, and get their OK.
 • memory_report — RAM pressure, purgeable memory, swap.

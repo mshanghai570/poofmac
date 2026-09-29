@@ -553,6 +553,240 @@ def toggle_launch_agent(label: str, enable: bool) -> dict:
     }
 
 
+# ── App Uninstaller — scan an app's bundle-id footprint, trash it safely ────────
+
+_APP_DIRS = (
+    Path.home() / "Applications",
+    Path("/Applications"),
+    Path("/System/Applications"),
+)
+
+# Every Library location an app can leave residue in, keyed by what it holds.
+# Matched against the bundle id first (authoritative), app name as fallback —
+# a name like "DevCleaner" can also appear inside unrelated bundle ids, so
+# matches are unioned carefully and every hit is shown before removal.
+_RESIDUAL_DIRS = (
+    "Application Support",
+    "Caches",
+    "Containers",
+    "Group Containers",
+    "Application Scripts",
+    "Logs",
+    "Saved Application State",
+    "Preferences",
+    "HTTPStorages",
+    "WebKit",
+    "LaunchAgents",
+)
+
+
+def _dir_size(path: Path) -> int:
+    """Recursive byte size; unreadable entries count as 0."""
+    total = 0
+    try:
+        for item in path.rglob("*"):
+            try:
+                if item.is_file() and not item.is_symlink():
+                    total += item.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return total
+
+
+def _residual_matches(bundle_id: str, app_name: str, root: Path, key: str) -> list[Path]:
+    """Residue paths under Library/<key> belonging to this app."""
+    base = root / "Library" / key
+    if not base.is_dir():
+        return []
+    needles: list[str] = []
+    if bundle_id:
+        # Group Containers prefix their team id: "58JULA45XG.app.DevCleaner".
+        needles.append(bundle_id.lower())
+    if app_name:
+        needles.append(app_name.lower())
+    if not needles:
+        return []
+    found: list[Path] = []
+    try:
+        for entry in base.iterdir():
+            entry_l = entry.name.lower()
+            if any(needle in entry_l for needle in needles):
+                found.append(entry)
+    except OSError:
+        pass
+    return found
+
+
+def find_app_residuals(bundle_id: str, app_name: str = "") -> dict:
+    """Every file this app left behind in ~/Library, with sizes.
+
+    Matches by bundle id (authoritative) and app name (fallback, since
+    pre-sandbox apps sometimes skip their bundle id in Preferences). Only the
+    user's own Library is searched — the system-wide /Library needs admin
+    rights and is deliberately out of reach.
+    """
+    if not bundle_id and not app_name:
+        return {"error": "Pass at least a bundle id or an app name."}
+    home = Path.home()
+    residuals: list[dict] = []
+    seen: set[str] = set()
+    for key in _RESIDUAL_DIRS:
+        for path in _residual_matches(bundle_id, app_name, home, key):
+            resolved = str(path)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            size = _dir_size(path) if path.is_dir() else (
+                path.stat().st_size if path.exists() else 0
+            )
+            residuals.append(
+                {
+                    "path": resolved,
+                    "kind": key,
+                    "size_bytes": size,
+                    "size_human": _human(size),
+                }
+            )
+    total = sum(r["size_bytes"] for r in residuals)
+    return {
+        "bundle_id": bundle_id,
+        "app_name": app_name,
+        "residuals": residuals,
+        "count": len(residuals),
+        "total_bytes": total,
+        "total_human": _human(total),
+        "note": (
+            "Removal moves items to the Trash — recoverable until it is emptied. "
+            "Preferences plists hold the app's settings: keep them if you plan "
+            "to reinstall and want your settings back."
+        ),
+    }
+
+
+def list_installed_apps() -> dict:
+    """Applications in /Applications, ~/Applications and /System/Applications."""
+    apps: list[dict] = []
+    seen: set[str] = set()
+    for directory in _APP_DIRS:
+        if not directory.is_dir():
+            continue
+        try:
+            entries = sorted(directory.glob("*.app"), key=lambda p: p.name.casefold())
+        except OSError:
+            continue
+        for bundle in entries:
+            resolved = str(bundle)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            bundle_id = ""
+            try:
+                data = plistlib.loads((bundle / "Contents" / "Info.plist").read_bytes())
+                bundle_id = str(data.get("CFBundleIdentifier", ""))
+            except Exception:  # noqa: BLE001 — Info.plist is optional
+                pass
+            apps.append(
+                {
+                    "name": bundle.stem,
+                    "bundle_id": bundle_id,
+                    "path": resolved,
+                    "scope": "user" if directory == _APP_DIRS[0] else "global",
+                }
+            )
+    return {
+        "apps": apps,
+        "count": len(apps),
+        "note": (
+            "System apps (in /System/Applications) are protected by SIP and "
+            "cannot be uninstalled. For anything else, find_app_residuals shows "
+            "what an uninstall would clean up."
+        ),
+    }
+
+
+def uninstall_app(app_path: str, remove_preferences: bool = True) -> dict:
+    """Move an application and its residual files to the Trash.
+
+    This is the whole uninstall: the .app bundle plus everything its bundle id
+    left in ~/Library. Items go to the Trash (recoverable), never rm. Refuses:
+    SIP-protected system apps, running apps, and anything outside the known
+    application directories.
+    """
+    if not app_path:
+        return {"success": False, "error": "Pass the path to an .app bundle."}
+    bundle = Path(app_path).resolve()
+    if bundle.suffix != ".app" or not bundle.is_dir():
+        return {"success": False, "error": f"{bundle} is not an .app bundle."}
+    allowed_parents = {str(d.resolve()) for d in _APP_DIRS}
+    if str(bundle.parent) not in allowed_parents:
+        return {
+            "success": False,
+            "error": (
+                f"{bundle} is not directly in an applications folder — refusing "
+                "paths outside /Applications, ~/Applications, /System/Applications."
+            ),
+        }
+    if str(bundle).startswith("/System/Applications/"):
+        return {"success": False, "error": "System apps are protected by SIP and cannot be removed."}
+
+    bundle_id = ""
+    try:
+        data = plistlib.loads((bundle / "Contents" / "Info.plist").read_bytes())
+        bundle_id = str(data.get("CFBundleIdentifier", ""))
+    except (OSError, ValueError):
+        pass
+    app_name = bundle.stem
+
+    # Refuse to trash a running app — its state files would be recreated on
+    # quit anyway, and a half-trashed bundle is worse than a running one.
+    ok, out = _run(["pgrep", "-f", str(bundle)], timeout=5.0)
+    if ok and out.strip():
+        return {
+            "success": False,
+            "error": f"{app_name} is running — quit it first (force_quit_app can help).",
+        }
+
+    trashed: list[dict] = []
+    failed: list[dict] = []
+    trash = Path.home() / ".Trash"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+
+    def _trash(path: Path) -> None:
+        try:
+            target = trash / f"{path.name} ({stamp})"
+            path.rename(target)
+            trashed.append({"path": str(path), "trashed_to": str(target)})
+        except OSError as exc:
+            failed.append({"path": str(path), "error": str(exc)[:120]})
+
+    _trash(bundle)
+    residuals = find_app_residuals(bundle_id, app_name).get("residuals", [])
+    for item in residuals:
+        path = Path(item["path"])
+        if not remove_preferences and item["kind"] == "Preferences":
+            continue  # keep settings for a future reinstall
+        if path.exists():
+            _trash(path)
+
+    freed = 0
+    for entry in trashed:
+        original = Path(entry["path"])
+        if original.exists():
+            freed += _dir_size(original) if original.is_dir() else original.stat().st_size
+    return {
+        "success": bool(trashed) and not failed,
+        "app": app_name,
+        "bundle_id": bundle_id,
+        "trashed": trashed,
+        "failed": failed,
+        "kept_preferences": not remove_preferences,
+        "freed_human": _human(freed),
+        "note": "Everything is in the Trash — recoverable until it is emptied.",
+    }
+
+
 # ── Guides for things that genuinely need the admin password ──────────────────
 
 MAINTENANCE_GUIDES: dict[str, dict] = {
