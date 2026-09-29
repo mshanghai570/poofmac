@@ -54,14 +54,15 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PoofMac-${{ github.ref_name }}-macOS-Intel
-          path: /Users/michaelshingara/Documents/poofmac/dist/PoofMac-0.2.4Intel.dmg
+          path: dist/*.dmg
+          if-no-files-found: error
           retention-days: 90
 
       - name: Attach Intel DMG to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: /Users/michaelshingara/Documents/poofmac/dist/PoofMac-0.2.4Intel.dmg
+          files: dist/*.dmg
           generate_release_notes: true
           body: |
             ## PoofMac ${{ github.ref_name }}
@@ -109,11 +110,12 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: PoofMac-${{ github.ref_name }}-macOS-AppleSilicon
-          path: /Users/michaelshingara/Documents/poofmac/dist/PoofMac-0.2.4Silicon.dmg
+          path: dist/*.dmg
+          if-no-files-found: error
           retention-days: 90
 
       - name: Attach Apple Silicon DMG to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: /Users/michaelshingara/Documents/poofmac/dist/PoofMac-0.2.4Silicon.dmg
+          files: dist/*.dmg

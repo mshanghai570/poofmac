@@ -1,52 +1,54 @@
 name: Handle Release Packaging
 
+# Publishes a GitHub Release with both DMGs after every successful build.
+# Previously three near-duplicate workflows (release.yml, manage.yml and this
+# file) raced to download an artifact name that never existed
+# ("PoofMac-main-macOS-Intel.zip") and failed on every run. This is the one
+# survivor, aligned with the artifact names build-dmg.yml actually uploads.
+
 on:
   workflow_run:
-    workflows: ["Build macOS DMG"]
+    workflows: ["Build macOS DMG"] # Matches build-dmg.yml's name exactly
     types:
       - completed
 
 permissions:
-  contents: write
+  contents: write # Grants write access to create the release pages
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    # Only executes if the build workflow finished successfully
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
-    
+
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      # 1. Download Intel Zip File
-      - name: Download Intel Zip Artifact
+      - name: Download Intel DMG Artifact
         uses: actions/download-artifact@v4
         with:
-          name: PoofMac-main-macOS-Intel.zip
-          path: ./compressed_assets/intel
+          name: PoofMac-${{ github.event.workflow_run.head_branch }}-macOS-Intel
+          path: ./extracted_dmgs
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. Download Apple Silicon Zip File
-      - name: Download Apple Silicon Zip Artifact
+      - name: Download Apple Silicon DMG Artifact
         uses: actions/download-artifact@v4
         with:
-          name: PoofMac-main-macOS-AppleSilicon.zip
-          path: ./compressed_assets/silicon
+          name: PoofMac-${{ github.event.workflow_run.head_branch }}-macOS-AppleSilicon
+          path: ./extracted_dmgs
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 3. Extract the archives to retrieve the .dmg installers
-      - name: Unzip Artifacts
-        run: |
-          mkdir -p ./extracted_dmgs
-          find ./compressed_assets -name "*.zip" -exec unzip -j {} -d ./extracted_dmgs/ \;
-          echo "=== Extracted Assets ==="
-          ls -la ./extracted_dmgs/
+      - name: List extracted assets
+        run: ls -la ./extracted_dmgs/
 
-      # 4. Generate the GitHub Release and upload both DMGs simultaneously
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v1.0.${{ github.event.workflow_run.run_number }}"
+
           echo "Publishing Release $TAG with installers..."
+
           gh release create "$TAG" ./extracted_dmgs/*.dmg \
             --title "Release $TAG" \
             --generate-notes
