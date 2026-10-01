@@ -22,6 +22,13 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
+      # Checkout is needed purely to read the app version out of pyproject.toml
+      # so the release tag matches the app (v0.3.0) instead of a run counter.
+      - name: Checkout built commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
       - name: Download Intel DMG Artifact
         uses: actions/download-artifact@v4
         with:
@@ -44,13 +51,25 @@ jobs:
       - name: Publish to GitHub Releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # No checkout in this job, so tell gh which repo to publish to.
+          # Keep gh pointed at this repo even though the checkout is a
+          # detached SHA rather than a branch.
           GH_REPO: ${{ github.repository }}
         run: |
-          TAG="v1.0.${{ github.event.workflow_run.run_number }}"
+          # Tag follows the app version in pyproject.toml, not the run counter:
+          # the previous scheme published "v1.0.20" for a 0.3.0 build.
+          VERSION=$(grep -m1 -E '^version[[:space:]]*=' pyproject.toml \
+            | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+          TAG="v${VERSION}"
 
           echo "Publishing Release $TAG with installers..."
 
-          gh release create "$TAG" ./extracted_dmgs/*.dmg \
-            --title "Release $TAG" \
-            --generate-notes
+          # Re-running the workflow for the same version refreshes the existing
+          # release rather than failing on "tag already exists".
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists - replacing its assets"
+            gh release upload "$TAG" ./extracted_dmgs/*.dmg --clobber
+          else
+            gh release create "$TAG" ./extracted_dmgs/*.dmg \
+              --title "Release $TAG" \
+              --generate-notes
+          fi
