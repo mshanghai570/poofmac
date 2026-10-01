@@ -60,6 +60,9 @@ packages = ["mac_cleaner"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "gui: Qt widget tests — need PySide6, run by the macOS CI job",
+]
 
 # ── Briefcase — macOS app bundle + DMG ────────────────────────────────────────
 # Build commands:

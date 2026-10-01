@@ -37,3 +37,23 @@ jobs:
 
       - name: Run the test suite
         run: pytest -q --maxfail=5
+
+  gui:
+    name: GUI widgets (offscreen, macOS)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install PoofMac, test deps and PySide6
+        run: pip install -e ".[dev]" "PySide6>=6.6.0,<6.9"
+
+      # Offscreen so the widgets are built and asserted on without a display
+      # session. gui.py is the largest module in the repo; this is the only
+      # place its tabs, labels and worker dispatch are exercised at all.
+      - name: Run the GUI tests
+        run: pytest -m gui -q --maxfail=5
