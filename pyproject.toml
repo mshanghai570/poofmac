@@ -64,6 +64,21 @@ markers = [
     "gui: Qt widget tests — need PySide6, run by the macOS CI job",
 ]
 
+# Coverage is measured on macOS, where the whole suite (including the Qt
+# tests) can run in one job. The floor in .github/workflows/tests.yml is a
+# ratchet: it is set at the measured value minus a point, and moves up as
+# tests are added, never down.
+[tool.coverage.run]
+source = ["mac_cleaner"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
+
 # ── Briefcase — macOS app bundle + DMG ────────────────────────────────────────
 # Build commands:
 #   pip install briefcase

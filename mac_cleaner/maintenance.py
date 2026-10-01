@@ -132,8 +132,11 @@ def _foreground_apps() -> list[dict]:
     apps: list[dict] = []
     if not ok:
         return apps
-    entries = re.split(r"\n\s*\d+\)\s", out)
-    for entry in entries[1:]:
+    # The leading "\n" matters: without it the first " 1) \"Name\" …" block has
+    # no newline before its index, so the split cannot match it and that app
+    # (always loginwindow, but still) is silently dropped.
+    entries = re.split(r"\n\s*\d+\)\s", "\n" + out)
+    for entry in entries:
         name_m = re.match(r'"([^"]+)"', entry)
         pid_m = re.search(r"pid = (\d+)", entry)
         type_m = re.search(r'type="(\w+)"', entry)
@@ -169,8 +172,11 @@ def hung_applications() -> dict:
     if reports_dir.is_dir():
         for report in sorted(reports_dir.glob("*.hang.ips"), key=lambda p: p.stat().st_mtime, reverse=True)[:10]:
             # Report names look like "AppName-2026-09-29-003608.hang.ips".
+            # Strip the four trailing fields (year, month, day, time); app
+            # names may themselves contain dashes ("Minecraft-2"), so split
+            # from the right and rejoin what is left.
             stem = report.name.removesuffix(".hang.ips")
-            app_name = stem.rsplit("-", 3)[0] if "-" in stem else stem
+            app_name = "-".join(stem.rsplit("-", 4)[:-4]) if stem.count("-") >= 4 else stem
             try:
                 age_hours = (time.time() - report.stat().st_mtime) / 3600
             except OSError:

@@ -39,7 +39,7 @@ jobs:
         run: pytest -q --maxfail=5
 
   gui:
-    name: GUI widgets (offscreen, macOS)
+    name: macOS (full suite + coverage)
     runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
@@ -52,8 +52,13 @@ jobs:
       - name: Install PoofMac, test deps and PySide6
         run: pip install -e ".[dev]" "PySide6>=6.6.0,<6.9"
 
-      # Offscreen so the widgets are built and asserted on without a display
-      # session. gui.py is the largest module in the repo; this is the only
-      # place its tabs, labels and worker dispatch are exercised at all.
-      - name: Run the GUI tests
-        run: pytest -m gui -q --maxfail=5
+      # The whole suite in one job: everything except the Qt tests also runs
+      # on Linux, but only here can gui.py and the macOS-specific paths be
+      # measured at all. The Qt widgets are built offscreen, so no display
+      # session is needed.
+      #
+      # --cov-fail-under is a ratchet, not a target: it is set one point below
+      # the measured total so a new test can never lower it, and raising it is
+      # part of adding coverage.
+      - name: Run the full suite with coverage
+        run: pytest -q --maxfail=5 --cov=mac_cleaner --cov-report=term-missing:skip-covered --cov-fail-under=36

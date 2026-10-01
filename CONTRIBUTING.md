@@ -64,11 +64,37 @@ If you are adding new scan categories, make sure:
 ## Pull requests
 
 - **One concern per PR** — keep changes focused.
-- **Tests welcome** — there is a `pytest` suite under `tests/` (coming soon).
+- **Tests are required** — there is a `pytest` suite under `tests/`, and CI
+  runs it on every push. See "Running the tests" below.
 - **No breaking changes to safety.py without discussion** — open an issue
   first if you need to modify the protected path lists.
 - Use [Conventional Commits](https://www.conventionalcommits.org/) style
   for commit messages: `feat:`, `fix:`, `docs:`, `refactor:`, `chore:`.
+
+## Running the tests
+
+```bash
+pip install -e ".[dev]"
+
+# The whole suite (macOS: includes the offscreen Qt tests)
+pytest -q
+
+# Everything except the Qt widget tests (works on Linux)
+pytest -q -m "not gui"
+
+# One area
+pytest tests/test_safety.py -v
+
+# With the coverage report CI enforces
+pytest -q --cov=mac_cleaner --cov-report=term-missing:skip-covered
+```
+
+The suite is hermetic: it never touches your real config directory, never
+installs a LaunchAgent, and every system command is stubbed, so a run cannot
+delete, kill or thin anything on the machine it runs on.
+
+`--cov-fail-under` in `.github/workflows/tests.yml` is a ratchet. It only
+ever goes up; raise it in the same pull request that adds coverage.
 
 ## Running the benchmark
 
