@@ -540,19 +540,25 @@ def toggle_launch_agent(label: str, enable: bool) -> dict:
     if not label or "/" in label or ".." in label:
         return {"success": False, "error": "A LaunchAgent label (plist filename without .plist) is required."}
     plist = _USER_AGENTS_DIR / f"{label}.plist"
-    if not plist.is_file():
-        return {"success": False, "error": f"No user LaunchAgent named {label!r} in {_USER_AGENTS_DIR}."}
-    target = plist.with_name(plist.name + ("" if enable else ".disabled"))
+    disabled = plist.with_name(plist.name + ".disabled")
+
+    # Each direction is looked up by its own filename. An earlier version
+    # demanded the .plist exist before branching, which made "enable" dead
+    # code: once an agent was disabled it could never be switched back on.
+    if enable:
+        if plist.is_file():
+            return {"success": False, "error": f"{label!r} is already enabled."}
+        if not disabled.is_file():
+            return {"success": False, "error": f"No disabled LaunchAgent named {label!r} in {_USER_AGENTS_DIR}."}
+        source, destination = disabled, plist
+    else:
+        if not plist.is_file():
+            hint = " It is already disabled." if disabled.is_file() else ""
+            return {"success": False, "error": f"No user LaunchAgent named {label!r} in {_USER_AGENTS_DIR}.{hint}"}
+        source, destination = plist, disabled
+
     try:
-        if enable:
-            current = _USER_AGENTS_DIR / f"{label}.plist.disabled"
-            if not current.is_file():
-                return {"success": False, "error": f"{label!r} is not disabled."}
-            current.rename(plist)
-        else:
-            if not plist.is_file():
-                return {"success": False, "error": f"{label!r} is already disabled."}
-            plist.rename(target)
+        source.rename(destination)
     except OSError as exc:
         return {"success": False, "error": f"Could not rename: {exc}"}
     return {
