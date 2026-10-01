@@ -61,6 +61,15 @@ jobs:
             | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
           TAG="v${VERSION}"
 
+          # Guard: both architectures must be present. If they ever collide on
+          # one filename again, fail the release loudly instead of quietly
+          # shipping an Intel-only download page.
+          COUNT=$(ls -1 ./extracted_dmgs/*.dmg 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$COUNT" -lt 2 ]; then
+            echo "Expected 2 DMGs (Intel + Apple Silicon), found $COUNT" >&2
+            exit 1
+          fi
+
           echo "Publishing Release $TAG with installers..."
 
           # Re-running the workflow for the same version refreshes the existing

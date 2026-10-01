@@ -50,6 +50,20 @@ jobs:
       - name: Package as DMG (ad-hoc signed)
         run: briefcase package macOS app --adhoc-sign
 
+      # Briefcase names both architectures' files identically, and the release
+      # job unzips both artifacts into one directory — so without this rename
+      # one DMG silently overwrites the other and half the downloads are for
+      # the wrong chip. Name them per architecture before uploading.
+      - name: Name the Intel DMG
+        run: |
+          VERSION=$(grep -m1 -E '^version[[:space:]]*=' pyproject.toml \
+            | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+          shopt -s nullglob
+          for f in dist/*.dmg; do
+            mv "$f" "dist/PoofMac-${VERSION}-macOS-Intel.dmg"
+          done
+          ls -la dist/*.dmg
+
       - name: Upload Intel DMG artifact
         uses: actions/upload-artifact@v4
         with:
@@ -105,6 +119,16 @@ jobs:
 
       - name: Package as DMG (ad-hoc signed)
         run: briefcase package macOS app --adhoc-sign
+
+      - name: Name the Apple Silicon DMG
+        run: |
+          VERSION=$(grep -m1 -E '^version[[:space:]]*=' pyproject.toml \
+            | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')
+          shopt -s nullglob
+          for f in dist/*.dmg; do
+            mv "$f" "dist/PoofMac-${VERSION}-macOS-AppleSilicon.dmg"
+          done
+          ls -la dist/*.dmg
 
       - name: Upload Apple Silicon DMG artifact
         uses: actions/upload-artifact@v4
