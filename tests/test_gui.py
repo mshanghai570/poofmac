@@ -29,6 +29,10 @@ from mac_cleaner import gui, maintenance, store  # noqa: E402
 from mac_cleaner.config import Settings  # noqa: E402
 from mac_cleaner.scanner import get_disk_usage  # noqa: E402
 
+# Selected by the macOS CI job (`pytest -m gui`); skipped by importorskip
+# everywhere else.
+pytestmark = pytest.mark.gui
+
 
 @pytest.fixture(scope="module")
 def app():
