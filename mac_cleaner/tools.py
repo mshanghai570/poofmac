@@ -529,6 +529,12 @@ def execute_tool(name: str, args: dict) -> str:
     Dispatch a tool call and return the result as a JSON string.
     This is the only path through which the LLM can trigger scanning.
     """
+    # Models occasionally emit arguments as a JSON string, a list, or nothing
+    # at all. Treat anything that is not a mapping as "no arguments" so a
+    # malformed call comes back as a tool error instead of an AttributeError
+    # thrown through the agent loop.
+    if not isinstance(args, dict):
+        args = {}
 
     if name == "get_disk_overview":
         return json.dumps(get_disk_usage())

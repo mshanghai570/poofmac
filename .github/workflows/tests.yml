@@ -1,0 +1,39 @@
+name: Tests
+
+# The safety guardrails, the tool registry and the disk-usage numbers are the
+# parts of PoofMac that quietly break user data or lie to the user, so they
+# get checked on every push. Runs on Linux: everything under test is pure
+# Python (statfs, plistlib, json), and the PySide6 GUI is not exercised here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install PoofMac and test dependencies
+        run: pip install -e ".[dev]"
+
+      - name: Run the test suite
+        run: pytest -q --maxfail=5

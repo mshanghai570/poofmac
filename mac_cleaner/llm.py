@@ -341,7 +341,10 @@ DISK-SCAN WORKFLOW — only when the user wants disk space cleaned
 1. Call get_disk_overview  →  understand current disk state.
 2. Call run_full_disk_scan →  find everything recoverable.
 3. For anything uncertain, call check_path_safety.
-4. Call propose_cleanup_plan with ALL findings.
+4. If you only need one category re-checked (a follow-up question about
+   caches, logs, downloads…), call scan_category with that category name
+   instead of re-running the whole scan.
+5. Call propose_cleanup_plan with ALL findings.
    - Include EVERY category found, even small ones.
    - Set risk_level accurately: SAFE / CAUTION / SKIP.
    - Write a clear "reason" for each item explaining what it is.
@@ -463,6 +466,20 @@ def _startup_facts() -> str:
     return "\n".join(lines)
 
 
+def _build_system_prompt() -> str:
+    """SYSTEM_PROMPT plus a LIVE FACTS snapshot taken right now.
+
+    Assembled once per conversation (CleanerAgent.__init__): the facts are a
+    snapshot, and re-reading them mid-conversation would invite the model to
+    talk about a state the user never saw change.
+    """
+    facts = _startup_facts()
+    if not facts:
+        return SYSTEM_PROMPT
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    return f"{SYSTEM_PROMPT}\n\nLIVE FACTS — snapshot at {stamp}\n{facts}\n"
+
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 class CleanerAgent:
@@ -481,11 +498,9 @@ class CleanerAgent:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.model, self.model_display = settings.get_active_model()
-        facts = _startup_facts()
-        system_prompt = SYSTEM_PROMPT
-        if facts:
-            system_prompt += f"\n\nLIVE FACTS — snapshot at {time.strftime('%Y-%m-%d %H:%M')}\n{facts}\n"
-        self.messages: list[dict] = [{"role": "system", "content": system_prompt}]
+        self.messages: list[dict] = [
+            {"role": "system", "content": _build_system_prompt()}
+        ]
         self.cleanup_plan: Optional[dict] = None
         self._sig = _origin_sig()
 

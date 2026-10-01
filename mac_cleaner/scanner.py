@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,10 +115,8 @@ def get_disk_usage() -> dict:
     10 GB "Used" figure and ~9% full on a disk that is really 91% full, which
     is how this used to tell people their nearly-full Mac was fine.
     ``statfs`` on the Data volume reports the whole container, so that is the
-    primary source; ``df`` remains the fallback for platforms without it.
+    primary source; ``df`` remains the    fallback for platforms without it.
     """
-    import shutil
-
     for path in ("/System/Volumes/Data", "/"):
         try:
             total, used, free = shutil.disk_usage(path)
