@@ -107,10 +107,42 @@ class ScanResult:
 # ── Individual scanners ───────────────────────────────────────────────────────
 
 def get_disk_usage() -> dict:
-    """Overall disk usage via df."""
+    """Overall disk usage for the volume that actually holds user data.
+
+    APFS shares one container between the sealed system volume and
+    /System/Volumes/Data, and ``df /`` reports only the system slice — a
+    10 GB "Used" figure and ~9% full on a disk that is really 91% full, which
+    is how this used to tell people their nearly-full Mac was fine.
+    ``statfs`` on the Data volume reports the whole container, so that is the
+    primary source; ``df`` remains the fallback for platforms without it.
+    """
+    import shutil
+
+    for path in ("/System/Volumes/Data", "/"):
+        try:
+            total, used, free = shutil.disk_usage(path)
+        except OSError:
+            continue
+        if total <= 0:
+            continue
+        return {
+            "total": total,
+            "used": used,
+            "free": free,
+            "total_human": format_size(total),
+            "used_human": format_size(used),
+            "free_human": format_size(free),
+            "used_percent": round(used / total * 100, 1),
+            "measured": "statfs",
+        }
+
+    # Fallback: parse df. Only reached if statfs fails on every path.
     try:
         proc = subprocess.run(
-            ["df", "-k", "/"], capture_output=True, text=True, timeout=10
+            ["df", "-k", "/System/Volumes/Data"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         lines = proc.stdout.strip().splitlines()
         if len(lines) >= 2:
@@ -129,13 +161,12 @@ def get_disk_usage() -> dict:
                 "used_human": format_size(used),
                 "free_human": format_size(free),
                 "used_percent": round(used / total * 100, 1) if total else 0,
+                "measured": "df",
             }
     except (subprocess.TimeoutExpired, ValueError, IndexError, FileNotFoundError):
         pass
 
-    # Fallback to shutil
-    import shutil
-    total, used, free = shutil.disk_usage("/")
+    total, used, free = 0, 0, 0
     return {
         "total": total,
         "used": used,
@@ -143,7 +174,8 @@ def get_disk_usage() -> dict:
         "total_human": format_size(total),
         "used_human": format_size(used),
         "free_human": format_size(free),
-        "used_percent": round(used / total * 100, 1) if total else 0,
+        "used_percent": 0,
+        "measured": "unavailable",
     }
 
 

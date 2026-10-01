@@ -34,6 +34,7 @@ from typing import Optional
 import litellm
 
 from mac_cleaner.config import MODEL_REGISTRY, Settings
+from mac_cleaner.scanner import get_disk_usage
 from mac_cleaner.tools import TOOLS, execute_tool
 
 
@@ -377,6 +378,21 @@ MAINTENANCE TOOLS
 • get_maintenance_guide — recipes for flush_dns_cache, reindex_spotlight,
   speed_up_boot, speed_up_mail, repair_disk_permissions.
 
+STARTUP FACTS
+─────────────
+Every conversation ends this prompt with a LIVE FACTS block (current disk
+usage and whether the maintenance timer is installed / how its last run went).
+It is a snapshot from the moment the chat opened — it can go stale, so call
+get_disk_overview before acting on it if the answer matters.
+
+• Use it to be useful immediately: if the disk is nearly full, open with that
+  instead of waiting to be asked; if the last scheduled run FAILED, say so in
+  one line and offer to look into it.
+• If the user enabled the timer, one short "your last run reclaimed X" is
+  welcome; do not repeat it in every later reply.
+• Never claim you ran a tool because a fact is in this block. It came from the
+  app, not from a tool call.
+
 ABSOLUTE RULES — never break these
 ──────────────────────────────────
 • You ONLY call the provided tools. You NEVER run shell commands yourself.
@@ -398,6 +414,55 @@ SKIP    — Anything system-critical, user data, or uncertain. Do not propose.
 """
 
 
+def _startup_facts() -> str:
+    """Live snapshot injected into the system prompt when a chat opens.
+
+    Cheap local reads only (one ``statfs``, plus the schedule plist and its
+    small JSON log) so opening a conversation stays instant and never blocks
+    on the network.
+    """
+    lines: list[str] = []
+    try:
+        usage = get_disk_usage()
+        lines.append(
+            f"• Disk: {usage['used_percent']}% full — {usage['used_human']} of "
+            f"{usage['total_human']} used, {usage['free_human']} free."
+        )
+    except Exception:  # noqa: BLE001 — a fact block must never break chat
+        pass
+    try:
+        from mac_cleaner import scheduler  # local import: avoids an import cycle
+
+        status = scheduler.schedule_status()
+        runs = status["last_runs"]
+        last = runs[0] if runs else None
+        if status["installed"] and last:
+            outcome = "ok" if last.get("success") else "FAILED"
+            detail = f"{last.get('snapshots_thinned', 0)} snapshot(s) thinned"
+            lines.append(
+                f"• Scheduled maintenance: on, {status['interval_label']} — "
+                f"last run {last.get('ran_at', 'unknown time')} ({outcome}, {detail})."
+            )
+        elif status["installed"]:
+            lines.append(
+                f"• Scheduled maintenance: on, {status['interval_label']} — "
+                "no runs recorded yet."
+            )
+        elif last:
+            # The timer was removed but its history is still on disk, and a
+            # recent failure is exactly what the user needs told about.
+            outcome = "ok" if last.get("success") else "FAILED"
+            lines.append(
+                f"• Scheduled maintenance: not installed — last run "
+                f"{last.get('ran_at', 'unknown time')} ({outcome})."
+            )
+        else:
+            lines.append("• Scheduled maintenance: not installed.")
+    except Exception:  # noqa: BLE001
+        pass
+    return "\n".join(lines)
+
+
 # ── Agent ─────────────────────────────────────────────────────────────────────
 
 class CleanerAgent:
@@ -416,7 +481,11 @@ class CleanerAgent:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.model, self.model_display = settings.get_active_model()
-        self.messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        facts = _startup_facts()
+        system_prompt = SYSTEM_PROMPT
+        if facts:
+            system_prompt += f"\n\nLIVE FACTS — snapshot at {time.strftime('%Y-%m-%d %H:%M')}\n{facts}\n"
+        self.messages: list[dict] = [{"role": "system", "content": system_prompt}]
         self.cleanup_plan: Optional[dict] = None
         self._sig = _origin_sig()
 
