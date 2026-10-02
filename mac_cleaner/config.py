@@ -302,7 +302,10 @@ def _model_ids(payload: Any) -> list[str]:
                     break
         if candidate.strip():
             found.add(candidate.strip())
-    return sorted(found, key=str.casefold)
+    # Two ids differing only in case ("A" / "a") tie on casefold, and a set's
+    # iteration order is not stable across runs — break the tie on the id
+    # itself so the listing a user sees is always in the same order.
+    return sorted(found, key=lambda model: (model.casefold(), model))
 
 
 def discover_models(

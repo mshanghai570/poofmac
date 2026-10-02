@@ -19,11 +19,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 @pytest.fixture(autouse=True)
 def isolated_config(tmp_path, monkeypatch):
-    """Point every config-dir reader at a throwaway directory."""
+    """Point every config-dir reader at a throwaway directory.
+
+    The endpoint store caches its parsed contents in a module global, so the
+    cache is dropped on both sides of the test — otherwise one test's saved
+    endpoints would leak into the next one's config directory.
+    """
+    from mac_cleaner import store
+
     config = tmp_path / "config"
     config.mkdir()
     monkeypatch.setenv("POOFMAC_CONFIG_DIR", str(config))
-    return config
+    store.invalidate()
+    yield config
+    store.invalidate()
 
 
 class _FakeLaunchAgents:

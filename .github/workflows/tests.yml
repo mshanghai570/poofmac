@@ -61,4 +61,4 @@ jobs:
       # the measured total so a new test can never lower it, and raising it is
       # part of adding coverage.
       - name: Run the full suite with coverage
-        run: pytest -q --maxfail=5 --cov=mac_cleaner --cov-report=term-missing:skip-covered --cov-fail-under=40
+        run: pytest -q --maxfail=5 --cov=mac_cleaner --cov-report=term-missing:skip-covered --cov-fail-under=46

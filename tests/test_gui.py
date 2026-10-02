@@ -111,12 +111,18 @@ def test_the_window_constructs(window):
 
 
 def test_the_disk_header_shows_the_real_number(window, app):
-    """Regression: this read 9% while the disk was 91% full."""
+    """Regression: this read 9% while the disk was 91% full.
+
+    The label is filled in when the header refreshes, so a disk that moves
+    between then and the fresh reading here can differ by a rounding step —
+    allow one percent rather than demanding an identical string.
+    """
     window._refresh_disk_overview()
     app.processEvents()
     usage = get_disk_usage()
-    assert window.disk_pct_lbl.text() == f"{int(usage['used_percent'])}%"
-    assert window.disk_bar.value() == int(usage["used_percent"])
+    shown = int(window.disk_pct_lbl.text().rstrip("%"))
+    assert abs(shown - usage["used_percent"]) <= 1
+    assert window.disk_bar.value() == shown
     title = window.disk_title_lbl.text()
     assert "used" in title and "free" in title
 
