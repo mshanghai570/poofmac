@@ -28,6 +28,7 @@ Guidance (needs Terminal; the LLM explains and the user runs it)
 
 from __future__ import annotations
 
+import hashlib
 import os
 import plistlib
 import re
@@ -887,6 +888,176 @@ def find_large_files(min_size_mb: int = 100, limit: int = 30) -> dict:
             "scanner. These are files in the open: installers, videos, archives, "
             "VM images. Trash them (GUI) or delete explicitly; nothing here is "
             "removed by this scan."
+        ),
+    }
+
+
+# ── Duplicate files ───────────────────────────────────────────────────────────
+
+_DUP_PARTIAL_BYTES = 64 * 1024  # cheap first pass: compare only the head
+_DUP_READ_CHUNK = 1024 * 1024  # 1 MiB buffer for the confirming full hash
+_DUP_TIME_BUDGET = 55.0  # seconds; the walk/hash yields partial results at the cap
+
+
+def _partial_digest(path: str) -> Optional[str]:
+    """Hash the first 64 KiB — enough to rule most same-size files in or out."""
+    digest = hashlib.blake2b(digest_size=16)
+    try:
+        with open(path, "rb") as handle:
+            digest.update(handle.read(_DUP_PARTIAL_BYTES))
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _full_digest(path: str) -> Optional[str]:
+    """Hash the whole file — the confirmation pass once sizes and heads match."""
+    digest = hashlib.blake2b(digest_size=32)
+    try:
+        with open(path, "rb") as handle:
+            while chunk := handle.read(_DUP_READ_CHUNK):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def find_duplicates(
+    min_size_kb: int = 1,
+    limit: int = 40,
+    roots: Optional[list[str]] = None,
+) -> dict:
+    """Files with byte-identical contents, grouped, largest reclaimable first.
+
+    Two-phase, so it does not hash a whole disk: files are first bucketed by
+    size (only a size shared by two or more files is interesting), then a
+    64 KiB head hash rules out almost everything, and only the survivors get a
+    full hash. Hard links to the same inode are collapsed so a linked file is
+    never reported as its own duplicate.
+
+    Read-only: nothing is removed here. Each group lists every copy, sizes and
+    mtimes, and marks the oldest copy as the one to keep. A time budget yields
+    partial results on huge homes — flagged in the output.
+    """
+    home = Path.home()
+    scan_roots = [Path(r) for r in roots] if roots else [home]
+    threshold = max(1, min_size_kb) * 1024
+    started = time.monotonic()
+    timed_out = False
+
+    # size -> list of (path, mtime, inode)
+    by_size: dict[int, list[tuple[str, float, tuple[int, int]]]] = {}
+    scanned = 0
+
+    for base in scan_roots:
+        # Only the home-wide scan prunes Library; an explicit root is honoured.
+        skip_top = {"Library", ".Trash"} if base == home else {".Trash"}
+        for root, dirs, files in os.walk(base, topdown=True, onerror=lambda e: None):
+            rel = os.path.relpath(root, base)
+            top = rel.split(os.sep)[0] if rel != "." else ""
+            if top in skip_top:
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if d not in _LF_SKIP_NAME]
+            for name in files:
+                scanned += 1
+                full = os.path.join(root, name)
+                try:
+                    if os.path.islink(full):
+                        continue
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                if st.st_size < threshold or st.st_size == 0:
+                    continue
+                by_size.setdefault(st.st_size, []).append(
+                    (full, st.st_mtime, (st.st_dev, st.st_ino))
+                )
+            if time.monotonic() - started > _DUP_TIME_BUDGET:
+                timed_out = True
+                break
+        if timed_out:
+            break
+
+    candidates = {size: items for size, items in by_size.items() if len(items) > 1}
+
+    groups: list[dict] = []
+    for size, items in candidates.items():
+        if time.monotonic() - started > _DUP_TIME_BUDGET:
+            timed_out = True
+            break
+        # Collapse hard links: keep the first path seen for each inode.
+        seen_inodes: set[tuple[int, int]] = set()
+        unique: list[tuple[str, float]] = []
+        for path, mtime, inode in items:
+            if inode in seen_inodes:
+                continue
+            seen_inodes.add(inode)
+            unique.append((path, mtime))
+        if len(unique) < 2:
+            continue
+
+        # Phase 1 — group by head hash.
+        head_buckets: dict[str, list[tuple[str, float]]] = {}
+        for path, mtime in unique:
+            head = _partial_digest(path)
+            if head is None:
+                continue
+            head_buckets.setdefault(head, []).append((path, mtime))
+        for head_group in head_buckets.values():
+            if len(head_group) < 2:
+                continue
+            # Phase 2 — confirm with a full hash.
+            full_buckets: dict[str, list[tuple[str, float]]] = {}
+            for path, mtime in head_group:
+                full = _full_digest(path)
+                if full is None:
+                    continue
+                full_buckets.setdefault(full, []).append((path, mtime))
+            for full_group in full_buckets.values():
+                if len(full_group) < 2:
+                    continue
+                copies = sorted(full_group, key=lambda item: item[1])
+                keep = copies[0][0]
+                groups.append(
+                    {
+                        "size_bytes": size,
+                        "size_human": _human(size),
+                        "count": len(copies),
+                        "wasted_bytes": size * (len(copies) - 1),
+                        "keep": keep,
+                        "files": [
+                            {
+                                "path": path,
+                                "modified": time.strftime(
+                                    "%Y-%m-%d", time.localtime(mtime)
+                                ),
+                                "is_oldest": path == keep,
+                            }
+                            for path, mtime in copies
+                        ],
+                    }
+                )
+
+    groups.sort(key=lambda g: g["wasted_bytes"], reverse=True)
+    shown = groups[:limit]
+    reclaimable = sum(g["wasted_bytes"] for g in groups)
+    return {
+        "groups": shown,
+        "shown_groups": len(shown),
+        "matched_groups": len(groups),
+        "duplicate_files": sum(g["count"] for g in groups),
+        "reclaimable_bytes": reclaimable,
+        "reclaimable_human": _human(reclaimable),
+        "files_scanned": scanned,
+        "candidate_files": sum(len(v) for v in candidates.values()),
+        "min_size_kb": min_size_kb,
+        "partial_scan": timed_out,
+        "elapsed_seconds": round(time.monotonic() - started, 1),
+        "note": (
+            "Contents only — nothing was deleted. The oldest copy in each group "
+            "is marked keep; trash the rest (GUI Duplicates tab) or delete "
+            "explicitly after check_path_safety."
         ),
     }
 

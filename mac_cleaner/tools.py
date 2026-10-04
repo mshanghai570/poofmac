@@ -239,6 +239,34 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "find_duplicates",
+            "description": (
+                "Find files with byte-identical contents in the user's home "
+                "directory (outside Library/caches), grouped largest-reclaimable "
+                "first. Read-only: nothing is removed. Each group lists every copy "
+                "and marks the oldest as the one to keep. Suggest the GUI's "
+                "Duplicates tab for trashing, or check_path_safety before proposing "
+                "specific copies for deletion."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "min_size_kb": {
+                        "type": "integer",
+                        "description": "Ignore files smaller than this in KB (default 1).",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max duplicate groups to return (default 40).",
+                    },
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "maintenance_schedule",
             "description": (
                 "Manage the automatic maintenance timer (a user LaunchAgent that "
@@ -600,6 +628,14 @@ def execute_tool(name: str, args: dict) -> str:
             maintenance.find_large_files(
                 min_size_mb=int(args.get("min_size_mb", 100) or 100),
                 limit=int(args.get("limit", 30) or 30),
+            )
+        )
+
+    if name == "find_duplicates":
+        return json.dumps(
+            maintenance.find_duplicates(
+                min_size_kb=int(args.get("min_size_kb", 1) or 1),
+                limit=int(args.get("limit", 40) or 40),
             )
         )
 

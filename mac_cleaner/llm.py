@@ -242,6 +242,8 @@ _KNOWN_TOOLS = {
     "list_installed_apps", "find_app_residuals", "uninstall_app",
     # Large files
     "find_large_files",
+    # Duplicates
+    "find_duplicates",
     # Scheduled maintenance
     "maintenance_schedule",
     "get_maintenance_history",
@@ -362,6 +364,10 @@ MAINTENANCE TOOLS
 • find_large_files — the biggest user files (installers, videos, archives).
   Read-only: report what you find with sizes and let the user decide; use
   check_path_safety before proposing any of them for deletion.
+• find_duplicates — files with identical contents, grouped by reclaimable
+  space, each group's oldest copy marked keep. Read-only. Report the groups
+  and let the user choose; suggest the GUI's Duplicates tab, and use
+  check_path_safety before proposing any copy for deletion.
 • maintenance_schedule — install/remove/check the automatic maintenance
   timer (LaunchAgent running the safe set: acceleration, snapshot thinning,
   large-file report). Only enable or remove it when the user asks; never

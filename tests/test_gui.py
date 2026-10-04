@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -23,6 +24,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6", reason="GUI tests need PySide6")
 
+from PySide6.QtCore import Qt  # noqa: E402
 from PySide6.QtWidgets import QApplication, QTabWidget, QWidget  # noqa: E402
 
 from mac_cleaner import gui, maintenance, store  # noqa: E402
@@ -61,6 +63,11 @@ def stub_maintenance(monkeypatch):
         maintenance,
         "find_large_files",
         lambda **kw: {"success": True, "files": [], "partial_scan": False},
+    )
+    monkeypatch.setattr(
+        maintenance,
+        "find_duplicates",
+        lambda **kw: {"success": True, "groups": [], "partial_scan": False},
     )
     return monkeypatch
 
@@ -143,11 +150,17 @@ def test_logging_keeps_the_html_and_the_text(window):
 
 # ── The maintenance dialog ────────────────────────────────────────────────────
 
-def test_all_four_tabs_exist(dialog):
+def test_all_five_tabs_exist(dialog):
     tabs = dialog.findChild(QTabWidget)
     assert tabs is not None, "the dialog has no tab widget"
     titles = [tabs.tabText(i) for i in range(tabs.count())]
-    for expected in ("Maintenance", "App Uninstaller", "Large Files", "Schedule"):
+    for expected in (
+        "Maintenance",
+        "App Uninstaller",
+        "Large Files",
+        "Duplicates",
+        "Schedule",
+    ):
         assert expected in titles, f"missing tab {expected!r} (have {titles})"
 
 
@@ -182,6 +195,7 @@ def test_the_hung_app_table_is_filled_from_the_report(dialog):
         ("residuals", "find_app_residuals"),
         ("uninstall", "uninstall_app"),
         ("large_files", "find_large_files"),
+        ("duplicates", "find_duplicates"),
     ],
 )
 def test_every_tab_action_reaches_its_function(stub_maintenance, action, function):
@@ -243,6 +257,50 @@ def test_the_report_the_dialog_receives_is_json(stub_maintenance):
     stub_maintenance.setattr(maintenance, "repair_applications", lambda **kw: {"success": True})
     _, report = _run_worker("repair")
     assert json.loads(report) == {"success": True}
+
+
+# ── The Duplicates tab ────────────────────────────────────────────────────────
+
+def test_the_duplicates_tab_pre_checks_the_extra_copies(dialog):
+    report = {
+        "success": True,
+        "groups": [
+            {
+                "size_human": "4 KB",
+                "files": [
+                    {"path": "/h/keep.txt", "modified": "2020-01-01", "is_oldest": True},
+                    {"path": "/h/dup.txt", "modified": "2021-01-01", "is_oldest": False},
+                ],
+            }
+        ],
+        "shown_groups": 1,
+        "duplicate_files": 2,
+        "reclaimable_human": "4 KB",
+        "partial_scan": False,
+        "files_scanned": 10,
+        "elapsed_seconds": 0.1,
+    }
+    dialog._populate_duplicates(report)
+    assert dialog.dup_table.rowCount() == 2
+    # The kept (oldest) copy is not a checkbox; the extra one is pre-ticked.
+    keep_chk = dialog.dup_table.item(0, 0)
+    dup_chk = dialog.dup_table.item(1, 0)
+    assert not (keep_chk.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+    assert dup_chk.checkState() == Qt.CheckState.Checked
+    assert dialog._dup_checked == {"/h/dup.txt"}
+    assert dialog.dup_trash_btn.isEnabled()
+
+
+def test_the_unique_trash_target_never_reuses_a_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    src = tmp_path / "report.pdf"
+    src.write_text("x")
+    first = gui._unique_trash_target(src)
+    first.parent.mkdir(parents=True, exist_ok=True)
+    first.write_text("already here")
+    second = gui._unique_trash_target(src)
+    assert second != first, "a second trash of the same name would overwrite the first"
+    assert not second.exists()
 
 
 # ── The first-run disclaimer ──────────────────────────────────────────────────

@@ -819,6 +819,22 @@ def _section_label(text: str) -> QLabel:
     return lbl
 
 
+def _unique_trash_target(src: Path) -> Path:
+    """A non-existent path in ~/.Trash for *src* — never overwrites a peer.
+
+    Duplicate files share a name, so the timestamped target can collide with an
+    earlier trash of the same name. Add a numeric suffix until it is free.
+    """
+    trash = Path.home() / ".Trash"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    candidate = trash / f"{src.name} ({stamp})"
+    counter = 1
+    while candidate.exists():
+        counter += 1
+        candidate = trash / f"{src.name} ({stamp}-{counter})"
+    return candidate
+
+
 def _h_separator(t: Theme) -> QFrame:
     line = QFrame()
     line.setFrameShape(QFrame.Shape.HLine)
@@ -1809,6 +1825,7 @@ class MaintenanceWorker(QThread):
             "residuals": maintenance.find_app_residuals,
             "uninstall": maintenance.uninstall_app,
             "large_files": maintenance.find_large_files,
+            "duplicates": maintenance.find_duplicates,
             "scheduled_run": _run_scheduled_set,
         }.get(self.action)
         if fn is None:
@@ -1843,6 +1860,7 @@ class MaintenanceDialog(QDialog):
         tabs.addTab(self._build_maintenance_tab(), "Maintenance")
         tabs.addTab(self._build_uninstaller_tab(), "App Uninstaller")
         tabs.addTab(self._build_large_files_tab(), "Large Files")
+        tabs.addTab(self._build_duplicates_tab(), "Duplicates")
         tabs.addTab(self._build_schedule_tab(), "Schedule")
 
         self._refresh_apps()
@@ -2217,9 +2235,7 @@ class MaintenanceDialog(QDialog):
                 if not src.is_file():
                     failed += 1
                     continue
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                target = Path.home() / ".Trash" / f"{src.name} ({stamp})"
-                src.rename(target)
+                src.rename(_unique_trash_target(src))
                 trashed += 1
             except OSError:
                 failed += 1
@@ -2240,7 +2256,191 @@ class MaintenanceDialog(QDialog):
         if self.lf_table.rowCount() == 0:
             self.lf_trash_btn.setEnabled(False)
 
-    # ── Tab 4: Schedule ────────────────────────────────────────────────────
+    # ── Tab 4: Duplicates ──────────────────────────────────────────────────
+
+    def _build_duplicates_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 12, 4, 4)
+        layout.setSpacing(10)
+
+        controls = QHBoxLayout()
+        controls.addWidget(_section_label("Ignore files smaller than"))
+        from PySide6.QtWidgets import QSpinBox
+
+        self.dup_size_spin = QSpinBox()
+        self.dup_size_spin.setRange(1, 100_000)
+        self.dup_size_spin.setValue(1)
+        self.dup_size_spin.setSuffix(" MB")
+        self.dup_size_spin.setFixedWidth(110)
+        controls.addWidget(self.dup_size_spin)
+        self.dup_scan_btn = _btn("🔍  Scan", "secondary")
+        self.dup_scan_btn.setToolTip(
+            "Walk the home directory (skipping caches and build trees) and group "
+            "files with identical contents. Takes up to a minute on a full disk."
+        )
+        self.dup_scan_btn.clicked.connect(self._on_duplicate_scan)
+        controls.addWidget(self.dup_scan_btn)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.dup_table = QTableWidget(0, 6)
+        self.dup_table.setHorizontalHeaderLabels(
+            ["", "Group", "File", "Modified", "Size", "Copy"]
+        )
+        hh = self.dup_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.dup_table.setColumnWidth(0, 36)
+        self.dup_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.dup_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.dup_table.setAlternatingRowColors(True)
+        self.dup_table.verticalHeader().setVisible(False)
+        layout.addWidget(self.dup_table, stretch=1)
+
+        dup_btn_row = QHBoxLayout()
+        self.dup_trash_btn = _btn("🗑  Trash Selected", "danger")
+        self.dup_trash_btn.setToolTip(
+            "Move the checked copies to the Trash — the oldest copy in each group "
+            "is kept. Recoverable until the Trash is emptied."
+        )
+        self.dup_trash_btn.setEnabled(False)
+        self.dup_trash_btn.clicked.connect(self._on_trash_duplicates)
+        dup_btn_row.addWidget(self.dup_trash_btn)
+        dup_btn_row.addStretch()
+        self.dup_status = QLabel("Press Scan to find files that are stored twice.")
+        self.dup_status.setObjectName("table_footer")
+        self.dup_status.setWordWrap(True)
+        dup_btn_row.addWidget(self.dup_status, stretch=1)
+        layout.addLayout(dup_btn_row)
+
+        self._dup_checked: set[str] = set()
+        self.dup_table.cellClicked.connect(self._on_dup_cell_clicked)
+        return page
+
+    def _on_duplicate_scan(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self._dup_checked.clear()
+        self.dup_table.setRowCount(0)
+        self.dup_trash_btn.setEnabled(False)
+        self._set_busy(True)
+        self.dup_status.setText("Scanning… (up to a minute on a full disk)")
+        self._worker = MaintenanceWorker(
+            "duplicates", min_size_kb=self.dup_size_spin.value() * 1024
+        )
+        self._worker.action_done.connect(self._on_action_done)
+        self._worker.start()
+
+    def _populate_duplicates(self, report: dict) -> None:
+        self.dup_table.setRowCount(0)
+        self._dup_checked.clear()
+        for index, group in enumerate(report.get("groups", []), start=1):
+            for f in group.get("files", []):
+                row = self.dup_table.rowCount()
+                self.dup_table.insertRow(row)
+                keep = bool(f.get("is_oldest"))
+                chk = QTableWidgetItem()
+                if keep:
+                    # The copy we keep is not a checkbox — it is the anchor.
+                    chk.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                else:
+                    chk.setFlags(
+                        Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled
+                    )
+                    chk.setCheckState(Qt.CheckState.Checked)
+                    self._dup_checked.add(f["path"])
+                self.dup_table.setItem(row, 0, chk)
+                self.dup_table.setItem(row, 1, QTableWidgetItem(str(index)))
+                self.dup_table.setItem(row, 2, QTableWidgetItem(f["path"]))
+                self.dup_table.setItem(row, 3, QTableWidgetItem(f.get("modified", "")))
+                size_item = QTableWidgetItem(group.get("size_human", ""))
+                size_item.setForeground(QColor("#FF9F0A"))
+                self.dup_table.setItem(row, 4, size_item)
+                kind = QTableWidgetItem("keep (oldest)" if keep else "duplicate")
+                kind.setForeground(QColor("#28CD41" if keep else "#FF3B30"))
+                self.dup_table.setItem(row, 5, kind)
+        partial = " (partial — time budget hit)" if report.get("partial_scan") else ""
+        self.dup_status.setText(
+            f'{report.get("shown_groups", 0)} duplicate group(s), '
+            f'{report.get("duplicate_files", 0)} files — '
+            f'{report.get("reclaimable_human", "0 B")} reclaimable{partial}; '
+            f'scanned {report.get("files_scanned", 0):,} files in '
+            f'{report.get("elapsed_seconds", 0)}s. Duplicates are pre-checked; '
+            "the oldest copy in each group is kept."
+        )
+        self.dup_trash_btn.setEnabled(bool(self._dup_checked))
+
+    def _on_dup_cell_clicked(self, row: int, _col: int) -> None:
+        chk = self.dup_table.item(row, 0)
+        path_item = self.dup_table.item(row, 2)
+        if chk is None or path_item is None:
+            return
+        if not (chk.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+            return
+        path = path_item.text()
+        if chk.checkState() == Qt.CheckState.Checked:
+            self._dup_checked.add(path)
+        else:
+            self._dup_checked.discard(path)
+        self.dup_status.setText(f"{len(self._dup_checked)} copy(ies) checked for trashing.")
+
+    def _on_trash_duplicates(self) -> None:
+        if not self._dup_checked:
+            QMessageBox.information(self, "Duplicates", "Check copies to trash first.")
+            return
+        listing = "\n".join(f"  · {p}" for p in sorted(self._dup_checked)[:20])
+        more = "\n  …" if len(self._dup_checked) > 20 else ""
+        answer = QMessageBox.question(
+            self,
+            "Trash duplicates",
+            f"Move {len(self._dup_checked)} duplicate copy(ies) to the Trash?\n\n"
+            f"{listing}{more}\n\nThe oldest copy in each group is kept. "
+            "Recoverable until the Trash is emptied.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        trashed, failed = 0, 0
+        for path in sorted(self._dup_checked):
+            try:
+                src = Path(path)
+                if not src.is_file():
+                    failed += 1
+                    continue
+                src.rename(_unique_trash_target(src))
+                trashed += 1
+            except OSError:
+                failed += 1
+        self._dup_checked.clear()
+        self.dup_status.setText(
+            f"✓ {trashed} duplicate(s) trashed"
+            + (f", {failed} failed — see paths still listed" if failed else "")
+            + ". Recoverable in the Trash."
+        )
+        self._populate_duplicates_keep_missing()
+
+    def _populate_duplicates_keep_missing(self) -> None:
+        """After trashing, drop rows whose file no longer exists."""
+        for row in range(self.dup_table.rowCount() - 1, -1, -1):
+            item = self.dup_table.item(row, 2)
+            if item and not Path(item.text()).exists():
+                self.dup_table.removeRow(row)
+        # Re-sync the checked set with the rows that survived, so the button
+        # state matches what is still ticked on screen.
+        self._dup_checked = {
+            self.dup_table.item(row, 2).text()
+            for row in range(self.dup_table.rowCount())
+            if (chk := self.dup_table.item(row, 0)) is not None
+            and (chk.flags() & Qt.ItemFlag.ItemIsUserCheckable)
+            and chk.checkState() == Qt.CheckState.Checked
+        }
+        self.dup_trash_btn.setEnabled(bool(self._dup_checked))
+
+    # ── Tab 5: Schedule ────────────────────────────────────────────────────
 
     def _build_schedule_tab(self) -> QWidget:
         from mac_cleaner import scheduler
@@ -2430,6 +2630,15 @@ class MaintenanceDialog(QDialog):
                 self._populate_large_files(_jf.loads(report))
             else:
                 self.lf_status.setText(f"✗ Scan failed: {report[:200]}")
+            return
+        if action == "duplicates":
+            self._set_busy(False)
+            if ok:
+                import json as _jd
+
+                self._populate_duplicates(_jd.loads(report))
+            else:
+                self.dup_status.setText(f"✗ Scan failed: {report[:200]}")
             return
         if action == "scheduled_run":
             self._set_busy(False)
