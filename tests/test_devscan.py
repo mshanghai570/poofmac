@@ -232,12 +232,14 @@ def test_cleanup_trashes_eligible_item(tmp_path, engine_tmp_roots):
     from mac_cleaner.devcleanup import DevCleanupEngine
     from mac_cleaner.audit import AuditLogger
 
-    before = {p.name for p in (Path.home() / ".Trash").iterdir()}
+    trash = Path.home() / ".Trash"
+    # A CI Linux host may not have a Trash dir yet; the engine creates it.
+    before = {p.name for p in trash.iterdir()} if trash.is_dir() else set()
     eng = DevCleanupEngine(AuditLogger(tmp_path / "audit.jsonl"))
     rep = eng.cleanup([_eligible_item(target)])
     assert [r.action for r in rep.results] == ["trashed"]
     assert not target.exists()
-    after = {p.name for p in (Path.home() / ".Trash").iterdir()}
+    after = {p.name for p in trash.iterdir()} if trash.is_dir() else set()
     gained = after - before
     assert gained, "nothing appeared in Trash"
     assert any(n.startswith("CacheMe") for n in gained)

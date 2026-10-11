@@ -106,6 +106,13 @@ class DevCleanupEngine:
     @staticmethod
     def _unique_trash_target(src: Path) -> Path:
         trash = Path.home() / ".Trash"
+        # The Trash usually exists on macOS, but a fresh/odd account (or a CI
+        # Linux host running the suite) may not have it — create it so the
+        # rename below lands somewhere instead of failing with ENOENT.
+        try:
+            trash.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
         stamp = time.strftime("%Y%m%d-%H%M%S")
         candidate = trash / f"{src.name} ({stamp})"
         counter = 1
