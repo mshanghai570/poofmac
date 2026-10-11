@@ -91,6 +91,8 @@ from mac_cleaner.config import (
 )
 from mac_cleaner.executor import Executor
 from mac_cleaner.llm import CleanerAgent, explain_provider_error
+from mac_cleaner import devclassify, devcleanup, devscan
+from mac_cleaner.dev_storage_tab import DevStorageTabMixin
 from mac_cleaner.scanner import format_size, get_disk_usage
 
 # ── Category visual metadata ──────────────────────────────────────────────────
@@ -1821,6 +1823,9 @@ class MaintenanceWorker(QThread):
             "repair": maintenance.repair_applications,
             "accelerate": maintenance.app_acceleration,
             "thin_snapshots": maintenance.thin_tm_snapshots,
+            "free_purgeable": maintenance.free_purgeable_space,
+            "flush_dns": maintenance.flush_dns_cache,
+            "free_ram": maintenance.free_ram,
             "list_apps": maintenance.list_installed_apps,
             "residuals": maintenance.find_app_residuals,
             "uninstall": maintenance.uninstall_app,
@@ -1842,9 +1847,12 @@ class MaintenanceWorker(QThread):
         self.action_done.emit(self.action, bool(ok), _json.dumps(result, indent=2))
 
 
-class MaintenanceDialog(QDialog):
-    """Maintenance panel: one-click actions, hung apps, and the uninstaller."""
+class MaintenanceDialog(DevStorageTabMixin, QDialog):
+    """Maintenance panel: one-click actions, hung apps, and the uninstaller.
 
+    The Developer Storage tab lives in dev_storage_tab.DevStorageTabMixin
+    to keep this file focused on shared infrastructure.
+    """
     def __init__(self, parent) -> None:
         super().__init__(parent)
         self.setWindowTitle("Maintenance")
@@ -1862,6 +1870,7 @@ class MaintenanceDialog(QDialog):
         tabs.addTab(self._build_large_files_tab(), "Large Files")
         tabs.addTab(self._build_duplicates_tab(), "Duplicates")
         tabs.addTab(self._build_schedule_tab(), "Schedule")
+        tabs.addTab(self._build_dev_storage_tab(), "Developer Storage")
 
         self._refresh_apps()
 
@@ -1912,6 +1921,37 @@ class MaintenanceDialog(QDialog):
         actions_row.addWidget(self.snapshots_btn)
         actions_row.addStretch()
         layout.addLayout(actions_row)
+
+        # ── Quick actions: reclaim / network / memory ────────────────────
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(8)
+
+        self.purge_btn = _btn("💾  Free Purgeable Space", "secondary")
+        self.purge_btn.setToolTip(
+            "Thin Time-Machine snapshots older than 1h and nudge the OS to drop "
+            "reclaimable disk caches. No user data is touched."
+        )
+        self.purge_btn.clicked.connect(self._on_free_purgeable)
+        quick_row.addWidget(self.purge_btn)
+
+        self.dns_btn = _btn("🌐  Flush DNS Cache", "secondary")
+        self.dns_btn.setToolTip(
+            "Clear the user-level DNS resolver cache (no admin password). If a "
+            "site still resolves to a stale address afterwards, the report "
+            "shows the two Terminal commands for the system-level cache."
+        )
+        self.dns_btn.clicked.connect(self._on_flush_dns)
+        quick_row.addWidget(self.dns_btn)
+
+        self.ram_btn = _btn("🧠  Free RAM", "secondary")
+        self.ram_btn.setToolTip(
+            "Ask macOS to wake purgeable memory accounting and show before/after "
+            "pressure. No app is killed — macOS already reclaims memory on demand."
+        )
+        self.ram_btn.clicked.connect(self._on_free_ram)
+        quick_row.addWidget(self.ram_btn)
+        quick_row.addStretch()
+        layout.addLayout(quick_row)
 
         # ── Running applications table ───────────────────────────────────
         layout.addWidget(_section_label("Running applications"))
@@ -2609,6 +2649,9 @@ class MaintenanceDialog(QDialog):
             "accelerate": "App Acceleration",
             "force_quit": "Force Quit",
             "thin_snapshots": "Thin Snapshots",
+            "free_purgeable": "Free Purgeable Space",
+            "flush_dns": "Flush DNS Cache",
+            "free_ram": "Free RAM",
             "uninstall": "Uninstall",
         }.get(action, action)
         self.report_view.append(
@@ -2710,6 +2753,34 @@ class MaintenanceDialog(QDialog):
         )
         if answer == QMessageBox.StandardButton.Yes:
             self._run_action("thin_snapshots", keep_hours=24)
+
+    def _on_free_purgeable(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Free Purgeable Space",
+            "Ask macOS to drop purgeable disk space now?\n\n"
+            "• Time-Machine snapshots older than 1 hour are thinned (shortens "
+            "the file-version recovery window).\n"
+            "• Reclaimable system caches are nudged out.\n"
+            "• No user data is touched; the OS decides what is safe.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._run_action("free_purgeable")
+
+    def _on_flush_dns(self) -> None:
+        self._run_action("flush_dns")
+
+    def _on_free_ram(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Free RAM",
+            "Ask macOS to wake purgeable memory and report pressure?\n\n"
+            "macOS already reclaims memory automatically — this is a gentle wake, "
+            "not a magic booster: no app is killed and nothing visible changes. "
+            "Unused RAM is not wasted RAM.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._run_action("free_ram")
 
     def closeEvent(self, event) -> None:
         if self._worker is not None and self._worker.isRunning():

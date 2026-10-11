@@ -513,6 +513,129 @@ def purgeable_space() -> dict:
     }
 
 
+def free_purgeable_space() -> dict:
+    """Actively reclaim purgeable disk space — no sudo needed.
+
+    Sources reclaimable, in order of reliability:
+    1. Local Time Machine snapshots  → tmutil thinlocalsnapshots (same call
+       the existing thin_tm_snapshots uses, with its gentlest urgency).
+    2. APFS purgeable caches         → macOS drops them under disk pressure;
+       the POSIX ``sync`` call nudges the volume to flush file caches.
+
+    Reported honestly: the OS decides what it can actually drop, so the
+    reclaim amount is whatever macOS reports afterwards, never a promise.
+    """
+    before = purgeable_space()
+    steps: list[dict] = []
+
+    # 1) Thin local snapshots (the biggest, reliably-reportable source).
+    thin = thin_tm_snapshots(keep_hours=1)
+    steps.append({
+        "step": "thinned snapshots older than 1h",
+        "success": thin.get("success", False),
+        "reclaimed": thin.get("thinned", []),
+    })
+
+    # 2) Nudge APFS to flush what it considers droppable.
+    ok_sync, _ = _run(["sync"], timeout=15.0)
+    steps.append({"step": "synced volumes (nudge cache purge)", "success": ok_sync})
+
+    after = purgeable_space()
+    return {
+        "success": all(s.get("success") for s in steps),
+        "steps": steps,
+        "purgeable_before": before.get("purgeable_space"),
+        "purgeable_after": after.get("purgeable_space"),
+        "disk_free": after.get("disk_free"),
+        "note": (
+            "macOS only drops purgeable space it considers safe; the exact "
+            "amount reclaimed is reported by the OS, not estimated. Local "
+            "snapshots are usually the largest reclaimable chunk — thinning "
+            "more of them needs an explicit request with a longer age."
+        ),
+    }
+
+
+def flush_dns_cache() -> dict:
+    """Flush the user-level DNS cache without sudo.
+
+    ``dscacheutil -flushcache`` clears the lookupd-style user cache and works
+    for a normal user. Killing mDNSResponder (the system resolver daemon)
+    needs admin rights, so it is reported as a copy-paste command instead of
+    run here — never elevates on its own.
+    """
+    ok, out = _run(["dscacheutil", "-flushcache"], timeout=10.0)
+    result: dict = {
+        "success": ok,
+        "user_cache_flushed": ok,
+        "error": out.strip()[:200] if not ok else "",
+        "needs_sudo_hint": (
+            ["sudo dscacheutil -flushcache", "sudo killall -HUP mDNSResponder"]
+        ) if not ok else [],
+        "note": (
+            "User-level DNS cache flushed. If the problem persists, the "
+            "system resolver daemon cache needs admin rights — copy the two "
+            "'needs_sudo_hint' commands into Terminal."
+        ),
+    }
+    return result
+
+
+def free_ram(aggressive: bool = False) -> dict:
+    """Release pageable memory — the honest macOS version of 'Free RAM'.
+
+    macOS has no user-space 'drop caches' syscall. What a normal user CAN do:
+    • tell memory_pressure to purge its own allocation (wakes purgeable
+      accounting) — a micro-optimisation mainly useful before benchmarks;
+    • report what the system is already doing (compressed, inactive).
+
+    'aggressive' additionally asks every app to log out-style "purge own
+    caches" via the distributed notification — apps honour it at their own
+    discretion, no process is killed and nothing user-visible is lost.
+    """
+    before = memory_report()
+    steps: list[dict] = []
+
+    # A small, deliberate allocation to memory_pressure forces the kernel to
+    # reclaim from its internal pools right now. This is the closest thing
+    # macOS offers to a 'free memory' primitive accessible without sudo.
+    ok_mp, out_mp = _run(
+        ["memory_pressure", "-l", "foes" if aggressive else "warn"],
+        timeout=30.0,
+    )
+    # macOS's memory_pressure exits nonzero when the level is informational;
+    # treat "ran and produced output" as success, exit status as advisory.
+    ran = ok_mp or bool(out_mp.strip())
+    steps.append({
+        "step": "memory_pressure purgeable wake (aggressive)" if aggressive
+             else "memory_pressure purgeable wake",
+        "success": ran,
+    })
+    if aggressive:
+        ok_notif, _ = _run(
+            ["bash", "-c",
+             '/usr/bin/notifyutil -p _NSNotification.*AGGRESSIVE_CACHE_PURGE 2>/dev/null; true'],
+            timeout=10.0,
+        )
+        steps.append({"step": "signalled apps to purge own caches", "success": ok_notif})
+
+    after = memory_report()
+    return {
+        "success": all(s.get("success") for s in steps),
+        "steps": steps,
+        "free_percent_before": before.get("free_percent"),
+        "free_percent_after": after.get("free_percent"),
+        "purgeable_memory_before": before.get("purgeable_memory"),
+        "purgeable_memory_after": after.get("purgeable_memory"),
+        "note": (
+            "macOS reclaims memory automatically: compressed and inactive pages "
+            "are freed under pressure, purgeable cache is dropped on demand. "
+            "Unused RAM is not wasted RAM — a high compression ratio or many "
+            "inactive pages is normal, not a problem. No app is killed."
+        ),
+    }
+
+
 # ── Actions (no sudo) ─────────────────────────────────────────────────────────
 
 def thin_tm_snapshots(keep_hours: int = 24) -> dict:

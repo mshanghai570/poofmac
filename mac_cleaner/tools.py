@@ -21,6 +21,8 @@ import json
 
 from mac_cleaner import maintenance
 from mac_cleaner.safety import validate_path
+from mac_cleaner.devclassify import classify as dev_classify
+from mac_cleaner.devscan import scan_developer_storage as _scan_developer_storage
 from mac_cleaner.scanner import (
     get_disk_usage,
     run_full_scan,
@@ -43,6 +45,24 @@ def _result_ok(payload: object) -> bool:
 # ── Tool schema ───────────────────────────────────────────────────────────────
 
 TOOLS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "scan_developer_storage",
+            "description": (
+                "Deep scan of Xcode and Apple-developer storage only: "
+                "DerivedData, Archives, iOS/watchOS DeviceSupport, simulator "
+                "devices, simulator runtimes and caches, and installed Xcode "
+                "copies. Read-only. Returns per-item sizes, versions, "
+                "deterministic classification (safe_cache / review_required / "
+                "potentially_obsolete / protected) and a plain-English "
+                "explanation for each item. Use for 'Xcode is eating my disk' "
+                "questions. Never delete — cleanup happens in the GUI after "
+                "the user reviews items."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -457,6 +477,55 @@ TOOLS: list[dict] = [
     {
         "type": "function",
         "function": {
+            "name": "free_purgeable_space",
+            "description": (
+                "Actively reclaim purgeable disk space: thin local Time Machine "
+                "snapshots older than 1h and nudge the APFS volume to drop "
+                "reclaimable caches. No sudo, no user data touched. Ask the user "
+                "before calling. Use purgeable_space first to see the scale."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "flush_dns_cache",
+            "description": (
+                "Flush the user-level DNS cache (dscacheutil -flushcache, no "
+                "sudo needed). Use after DNS changes or stale lookups. If issues "
+                "persist the response's needs_sudo_hint holds the two Terminal "
+                "commands for the system resolver cache."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "free_ram",
+            "description": (
+                "Honest macOS memory reclaim: ask the kernel to wake purgeable "
+                "accounting and report before/after pressure. macOS reclaims "
+                "memory automatically; this never kills apps. Explain that "
+                "unused RAM is not wasted RAM. Use when the user insists on "
+                "'freeing RAM'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "aggressive": {
+                        "type": "boolean",
+                        "description": "Also signal apps to purge their own caches (default false).",
+                    }
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_maintenance_guide",
             "description": (
                 "Get a ready-to-copy Terminal recipe for maintenance that needs admin "
@@ -584,6 +653,21 @@ def execute_tool(name: str, args: dict) -> str:
         results = scanner()
         return json.dumps([r.to_dict() for r in results])
 
+    if name == "scan_developer_storage":
+        report = _scan_developer_storage()
+        # Attach the deterministic classification + explanation per item.
+        for item in report.get("items", []):
+            cls = dev_classify(item, report)
+            item.update(cls)
+        # Keep the LLM context lean: top 40 items by size only.
+        items = sorted(
+            report.get("items", []),
+            key=lambda i: i.get("size_bytes", 0),
+            reverse=True,
+        )
+        report["items"] = items[:40]
+        return json.dumps(report)
+
     if name == "check_path_safety":
         path = args.get("path", "")
         if not path:
@@ -700,6 +784,17 @@ def execute_tool(name: str, args: dict) -> str:
 
     if name == "purgeable_space":
         return json.dumps(maintenance.purgeable_space())
+
+    if name == "free_purgeable_space":
+        return json.dumps(maintenance.free_purgeable_space())
+
+    if name == "flush_dns_cache":
+        return json.dumps(maintenance.flush_dns_cache())
+
+    if name == "free_ram":
+        return json.dumps(
+            maintenance.free_ram(aggressive=bool(args.get("aggressive", False)))
+        )
 
     if name == "get_maintenance_guide":
         return json.dumps(maintenance.get_maintenance_guide(str(args.get("name", ""))))

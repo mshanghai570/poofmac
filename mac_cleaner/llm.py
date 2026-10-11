@@ -233,6 +233,7 @@ def explain_provider_error(
 _KNOWN_TOOLS = {
     "get_disk_overview", "run_full_disk_scan", "scan_category",
     "check_path_safety", "propose_cleanup_plan",
+    "scan_developer_storage",
     # Maintenance & optimization
     "heavy_consumers", "hung_applications", "force_quit_app",
     "repair_applications", "app_acceleration", "launch_agents",
@@ -247,6 +248,7 @@ _KNOWN_TOOLS = {
     # Scheduled maintenance
     "maintenance_schedule",
     "get_maintenance_history",
+    "free_purgeable_space", "flush_dns_cache", "free_ram",
 }
 
 
@@ -351,6 +353,19 @@ DISK-SCAN WORKFLOW — only when the user wants disk space cleaned
    - Set risk_level accurately: SAFE / CAUTION / SKIP.
    - Write a clear "reason" for each item explaining what it is.
 
+DEVELOPER STORAGE (Xcode)
+─────────────────────────
+• scan_developer_storage gives a deep, per-item view of Xcode/Simulator
+  storage: DerivedData, Archives, DeviceSupport, simulator devices and
+  runtimes — each already classified by deterministic rules (the LLM does
+  NOT decide what is safe; the code does).
+• You may quote the classification and the explanation text, and you may
+  point the user at the GUI's Developer Storage tab for cleanup.
+• You must NOT claim an item is removable beyond its classification, and
+  you must NEVER propose deleting: Xcode.app, app Archives, device
+  support for a currently supported target, or any runtime a project
+  might still target. Old does not mean unused.
+
 MAINTENANCE TOOLS
 ─────────────────
 • heavy_consumers — what is using CPU/RAM right now.
@@ -384,6 +399,14 @@ MAINTENANCE TOOLS
 • tm_snapshots / thin_tm_snapshots — local snapshots eat disk; you may thin
   them after the user agrees.
 • purgeable_space — what macOS could drop on demand.
+• free_purgeable_space — actually reclaim it (thins 1h-old snapshots, nudges
+  APFS). Ask the user before calling; report the OS's own numbers, never a
+  promised amount.
+• flush_dns_cache — user-level DNS flush, no sudo. Mention the sudo hint it
+  returns if the problem persists.
+• free_ram — honest macOS memory reclaim (purgeable wake + report). NEVER
+  claim it magically adds RAM; unused RAM is not wasted RAM and no app is
+  killed. Set expectations, then run it if the user still wants it.
 • get_maintenance_guide — recipes for flush_dns_cache, reindex_spotlight,
   speed_up_boot, speed_up_mail, repair_disk_permissions.
 
